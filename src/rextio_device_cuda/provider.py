@@ -6,11 +6,10 @@ import json
 import re
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING
-
 from rextio.artifacts import (
     ArtifactKind,
     CertificationTier,
+    DeviceRequirement,
     RuntimeRequirement,
     TargetCapability,
 )
@@ -42,13 +41,15 @@ from rextio_device_cuda.probe import (
     expected_probe_target,
 )
 
-if TYPE_CHECKING:
-    from rextio.artifacts import DeviceRequirement
-
 PROVIDER_ID = "rextio-device-cuda"
 CAPABILITY_LINUX_X86_64 = "cuda-linux-x86_64"
 CAPABILITY_LINUX_AARCH64 = "cuda-linux-aarch64"
 CAPABILITY_WINDOWS_X86_64 = "cuda-windows-x86_64"
+CAPABILITY_LIBTORCH_LINUX_X86_64 = "cuda-libtorch-linux-x86_64"
+
+LIBTORCH_RUNTIME = "libtorch"
+LIBTORCH_VERSION = "2.11.0"
+TCH_VERSION = "0.24.0"
 
 _SM_PATTERN = re.compile(r"^sm_[0-9]{2,3}$")
 _ARCHITECTURES = (
@@ -67,10 +68,13 @@ _CAPABILITY_TARGETS = {
     CAPABILITY_LINUX_X86_64: "x86_64-unknown-linux-gnu",
     CAPABILITY_LINUX_AARCH64: "aarch64-unknown-linux-gnu",
     CAPABILITY_WINDOWS_X86_64: "x86_64-pc-windows-msvc",
+    CAPABILITY_LIBTORCH_LINUX_X86_64: "x86_64-unknown-linux-gnu",
 }
-_ALLOWED_OPTION_KEYS = frozenset(
-    {"probe_executable", "toolkit_root", "device_ordinal", "sm"}
-)
+_RAW_ALLOWED_OPTION_KEYS = frozenset({"probe_executable", "toolkit_root", "device_ordinal", "sm"})
+_FRAMEWORK_ALLOWED_OPTION_KEYS = frozenset({"probe_executable", "device_ordinal", "sm"})
+_FRAMEWORK_FEATURES = frozenset({"inference", "no-grad"})
+_FRAMEWORK_LAYOUTS = frozenset({"strided"})
+_FRAMEWORK_MEMORY_SPACES = frozenset({"device"})
 _ARTIFACT_KINDS = (
     ArtifactKind.HOST_EXECUTABLE,
     ArtifactKind.HOST_EXTENSION,
@@ -96,11 +100,38 @@ def _capability(capability_id: str, target_triple: str) -> TargetCapability:
     )
 
 
+def _libtorch_capability() -> TargetCapability:
+    return TargetCapability(
+        id=CAPABILITY_LIBTORCH_LINUX_X86_64,
+        target_triples=("x86_64-unknown-linux-gnu",),
+        artifact_kinds=(ArtifactKind.HOST_EXTENSION,),
+        accelerator_backends=("cuda",),
+        minimum_runtime_version=LIBTORCH_VERSION,
+        minimum_driver_version=str(CUDA_DRIVER_VERSION_FLOOR),
+        architectures=_ARCHITECTURES,
+        device_requirements=(
+            DeviceRequirement(
+                logical_device="gpu:0",
+                backend="cuda",
+                runtime=LIBTORCH_RUNTIME,
+                features=tuple(_FRAMEWORK_FEATURES),
+                layouts=tuple(_FRAMEWORK_LAYOUTS),
+                memory_spaces=tuple(_FRAMEWORK_MEMORY_SPACES),
+                reuse_domain_runtime=True,
+            ),
+        ),
+        certification_tier=CertificationTier.BUILD_ONLY,
+        evidence_references=_EVIDENCE,
+    )
+
+
 def _request_fingerprint(request: DevicePreflightRequest) -> str:
     return json.dumps(request.to_dict(), sort_keys=True, separators=(",", ":"))
 
 
-def _cuda_requirement(request: DevicePreflightRequest) -> tuple[DeviceRequirement, int, str]:
+def _raw_cuda_requirement(
+    request: DevicePreflightRequest,
+) -> tuple[DeviceRequirement, int, str]:
     candidates: list[tuple[DeviceRequirement, int, str]] = []
     for requirement in request.artifact_profile.device_requirements:
         try:
@@ -133,6 +164,54 @@ def _cuda_requirement(request: DevicePreflightRequest) -> tuple[DeviceRequiremen
     return requirement, ordinal, sm
 
 
+def _libtorch_cuda_requirement(
+    request: DevicePreflightRequest,
+) -> tuple[DeviceRequirement, int, str | None]:
+    requirements = request.artifact_profile.device_requirements
+    if len(requirements) != 1:
+        raise CudaProbeError("EXACTLY_ONE_CUDA_DEVICE_REQUIRED")
+    requirement = requirements[0]
+    try:
+        device = normalize_device_id(
+            requirement.logical_device,
+            backend=requirement.backend,
+        )
+    except ValueError as exc:
+        raise CudaProbeError("CUDA_DEVICE_REQUIREMENT_INVALID") from exc
+    if device.kind != "gpu" or device.backend != "cuda" or device.index != 0:
+        raise CudaProbeError("LIBTORCH_CUDA_DEVICE_UNSUPPORTED")
+    if requirement.runtime != LIBTORCH_RUNTIME:
+        raise CudaProbeError("LIBTORCH_RUNTIME_REQUIRED")
+    if not requirement.reuse_domain_runtime:
+        raise CudaProbeError("LIBTORCH_RUNTIME_REUSE_REQUIRED")
+    if len(requirement.architectures) > 1:
+        raise CudaProbeError("AT_MOST_ONE_SM_ALLOWED")
+    sm = requirement.architectures[0] if requirement.architectures else None
+    if sm is not None and _SM_PATTERN.fullmatch(sm) is None:
+        raise CudaProbeError("INVALID_SM")
+    if frozenset(requirement.features) != _FRAMEWORK_FEATURES:
+        raise CudaProbeError("LIBTORCH_FEATURES_INCOMPATIBLE")
+    if frozenset(requirement.layouts) != _FRAMEWORK_LAYOUTS:
+        raise CudaProbeError("LIBTORCH_LAYOUT_INCOMPATIBLE")
+    if frozenset(requirement.memory_spaces) != _FRAMEWORK_MEMORY_SPACES:
+        raise CudaProbeError("LIBTORCH_MEMORY_SPACE_INCOMPATIBLE")
+
+    runtime_requirements = {
+        item.name: (item.version, item.features)
+        for item in request.artifact_profile.runtime_requirements
+    }
+    expected_runtime_requirements = {
+        "libtorch": (LIBTORCH_VERSION, ("cuda", "pytorch-wheel")),
+        "tch": (TCH_VERSION, ("cuda",)),
+    }
+    if any(
+        runtime_requirements.get(name) != expected
+        for name, expected in expected_runtime_requirements.items()
+    ):
+        raise CudaProbeError("LIBTORCH_RUNTIME_PINS_REQUIRED")
+    return requirement, device.index, sm
+
+
 def _private_option(request: DevicePreflightRequest, key: str) -> str | None:
     """Read an additive API-1 options record without requiring it at import time."""
     options = getattr(request, "options", None)
@@ -143,13 +222,17 @@ def _private_option(request: DevicePreflightRequest, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _validate_private_option_keys(request: DevicePreflightRequest) -> None:
+def _validate_private_option_keys(
+    request: DevicePreflightRequest,
+    *,
+    allowed_keys: frozenset[str],
+) -> None:
     """Reject unknown private inputs before any provider-owned observation."""
     options = getattr(request, "options", None)
     keys = getattr(options, "keys", ())
     if not isinstance(keys, tuple) or any(not isinstance(key, str) for key in keys):
         raise CudaProbeError("PROVIDER_OPTIONS_INVALID")
-    if set(keys) - _ALLOWED_OPTION_KEYS:
+    if set(keys) - allowed_keys:
         raise CudaProbeError("PROVIDER_OPTION_UNKNOWN")
 
 
@@ -187,6 +270,7 @@ class CudaDeviceProvider:
         self._probe_runner = probe_runner
         self._toolkit_inspector = toolkit_inspector
         self._ready_requests: set[str] = set()
+        self._request_generations: dict[str, int] = {}
         self._ready_lock = Lock()
 
     def manifest(self) -> DeviceProviderManifest:
@@ -197,9 +281,13 @@ class CudaDeviceProvider:
             provider_version=__version__,
             backend="cuda",
             api_version=DEVICE_PROVIDER_API_VERSION,
-            capabilities=tuple(
-                _capability(capability_id, target)
-                for capability_id, target in _CAPABILITY_TARGETS.items()
+            capabilities=(
+                *(
+                    _capability(capability_id, target)
+                    for capability_id, target in _CAPABILITY_TARGETS.items()
+                    if capability_id != CAPABILITY_LIBTORCH_LINUX_X86_64
+                ),
+                _libtorch_capability(),
             ),
             runtime_requirements=(
                 RuntimeRequirement(
@@ -225,6 +313,11 @@ class CudaDeviceProvider:
 
     def preflight(self, request: DevicePreflightRequest) -> DevicePreflightResult:
         """Verify exact target, device, SM, driver, runtime, and toolkit facts."""
+        request_fingerprint = _request_fingerprint(request)
+        with self._ready_lock:
+            request_generation = self._request_generations.get(request_fingerprint, 0) + 1
+            self._request_generations[request_fingerprint] = request_generation
+            self._ready_requests.discard(request_fingerprint)
         if request.selection.provider_id != PROVIDER_ID:
             return self._failure("PROVIDER_ID_MISMATCH", incompatible=True)
         expected_target = _CAPABILITY_TARGETS.get(request.selection.capability_id)
@@ -232,23 +325,48 @@ class CudaDeviceProvider:
             return self._failure("CAPABILITY_UNKNOWN", incompatible=True)
         if request.artifact_profile.target_triple != expected_target:
             return self._failure("TARGET_MISMATCH", incompatible=True)
+        framework_runtime_reuse = (
+            request.selection.capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64
+        )
+        if (
+            framework_runtime_reuse
+            and request.artifact_profile.kind is not ArtifactKind.HOST_EXTENSION
+        ):
+            return self._failure(
+                "LIBTORCH_ARTIFACT_KIND_UNSUPPORTED",
+                incompatible=True,
+            )
         try:
-            _validate_private_option_keys(request)
-            _, required_ordinal, required_sm = _cuda_requirement(request)
-            if required_sm not in _ARCHITECTURES:
+            _validate_private_option_keys(
+                request,
+                allowed_keys=(
+                    _FRAMEWORK_ALLOWED_OPTION_KEYS
+                    if framework_runtime_reuse
+                    else _RAW_ALLOWED_OPTION_KEYS
+                ),
+            )
+            if framework_runtime_reuse and self._config.toolkit_root is not None:
+                raise CudaProbeError("LIBTORCH_TOOLKIT_ROOT_UNSUPPORTED")
+            if framework_runtime_reuse:
+                _, required_ordinal, required_sm = _libtorch_cuda_requirement(request)
+            else:
+                _, required_ordinal, required_sm = _raw_cuda_requirement(request)
+            if required_sm is not None and required_sm not in _ARCHITECTURES:
                 raise CudaProbeError("CUDA_ARCHITECTURE_UNSUPPORTED")
             probe_path = _coalesce_private_value(
                 _private_option(request, "probe_executable"),
                 str(self._config.probe_path) if self._config.probe_path is not None else None,
                 conflict_reason="PROBE_CONFIGURATION_CONFLICT",
             )
-            toolkit_root = _coalesce_private_value(
-                _private_option(request, "toolkit_root"),
-                str(self._config.toolkit_root)
-                if self._config.toolkit_root is not None
-                else None,
-                conflict_reason="TOOLKIT_CONFIGURATION_CONFLICT",
-            )
+            toolkit_root = None
+            if not framework_runtime_reuse:
+                toolkit_root = _coalesce_private_value(
+                    _private_option(request, "toolkit_root"),
+                    str(self._config.toolkit_root)
+                    if self._config.toolkit_root is not None
+                    else None,
+                    conflict_reason="TOOLKIT_CONFIGURATION_CONFLICT",
+                )
             ordinal_text = _coalesce_private_value(
                 _private_option(request, "device_ordinal"),
                 (
@@ -276,7 +394,9 @@ class CudaDeviceProvider:
                 raise CudaProbeError("INVALID_SM")
             if selected_sm not in _ARCHITECTURES:
                 raise CudaProbeError("CUDA_ARCHITECTURE_UNSUPPORTED")
-            if ordinal != required_ordinal or selected_sm != required_sm:
+            if ordinal != required_ordinal or (
+                required_sm is not None and selected_sm != required_sm
+            ):
                 raise CudaProbeError("DEVICE_REQUIREMENT_MISMATCH")
             expected_probe = expected_probe_target(expected_target)
             report = self._runner(probe_path).run()
@@ -293,7 +413,7 @@ class CudaDeviceProvider:
             device = report.devices[ordinal]
             if device.ordinal != ordinal or device.sm != selected_sm:
                 raise CudaProbeError("CUDA_SM_MISMATCH")
-            inspector = self._inspector(toolkit_root)
+            inspector = None if framework_runtime_reuse else self._inspector(toolkit_root)
             toolkit = inspector.inspect(expected_target) if inspector is not None else None
             if toolkit is not None:
                 toolkit_version = toolkit.version_tuple
@@ -305,27 +425,51 @@ class CudaDeviceProvider:
             return self._failure(exc.reason_code)
 
         with self._ready_lock:
-            self._ready_requests.add(_request_fingerprint(request))
+            if self._request_generations.get(request_fingerprint) == request_generation:
+                self._ready_requests.add(request_fingerprint)
+        observations = [
+            ("device.count", str(report.device_count)),
+            ("driver.version", str(report.driver_version)),
+            (
+                "policy.minimum-driver-version",
+                str(self._config.minimum_driver_version),
+            ),
+            ("probe.schema", "1"),
+            ("selected.device", str(ordinal)),
+            ("selected.sm", selected_sm),
+            ("target.arch", report.target.arch),
+            ("target.os", report.target.os),
+        ]
+        if framework_runtime_reuse:
+            observations.extend(
+                (
+                    ("framework.runtime", LIBTORCH_RUNTIME),
+                    ("framework.runtime-pin", LIBTORCH_VERSION),
+                    ("framework.binding-pin", TCH_VERSION),
+                    ("framework.reuse", "required-unverified"),
+                )
+            )
+        else:
+            observations.extend(
+                (
+                    (
+                        "policy.minimum-toolkit-version",
+                        ".".join(str(part) for part in self._config.minimum_toolkit_version),
+                    ),
+                    (
+                        "toolkit.runtime",
+                        toolkit.runtime_version if toolkit is not None else "not-configured",
+                    ),
+                    (
+                        "toolkit.version",
+                        toolkit.version if toolkit is not None else "not-configured",
+                    ),
+                )
+            )
         return DevicePreflightResult(
             provider_id=PROVIDER_ID,
             status=DevicePreflightStatus.READY,
-            observations=(
-                ("device.count", str(report.device_count)),
-                ("driver.version", str(report.driver_version)),
-                ("probe.schema", "1"),
-                ("selected.device", str(ordinal)),
-                ("selected.sm", selected_sm),
-                ("target.arch", report.target.arch),
-                ("target.os", report.target.os),
-                (
-                    "toolkit.runtime",
-                    toolkit.runtime_version if toolkit is not None else "not-configured",
-                ),
-                (
-                    "toolkit.version",
-                    toolkit.version if toolkit is not None else "not-configured",
-                ),
-            ),
+            observations=tuple(observations),
             support_claim=False,
         )
 
@@ -355,10 +499,29 @@ class CudaDeviceProvider:
             ready = _request_fingerprint(request) in self._ready_requests
         if not ready:
             raise RuntimeError("CUDA provider build contribution requires successful preflight")
+        if request.selection.capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64:
+            return DeviceBuildContribution(
+                resource_contracts=(
+                    DeviceResourceContract(
+                        resource_kind="framework.tensor",
+                        owner=DeviceResourceOwner.FRAMEWORK,
+                        access=DeviceResourceAccess.BORROW_VALIDATE,
+                    ),
+                    DeviceResourceContract(
+                        resource_kind="framework.allocator",
+                        owner=DeviceResourceOwner.FRAMEWORK,
+                        access=DeviceResourceAccess.BORROW_VALIDATE,
+                    ),
+                    DeviceResourceContract(
+                        resource_kind="framework.current-stream",
+                        owner=DeviceResourceOwner.FRAMEWORK,
+                        access=DeviceResourceAccess.BORROW_VALIDATE,
+                    ),
+                ),
+            )
         return DeviceBuildContribution(
             package_references=(
-                "generated/device-providers/rextio-device-cuda/"
-                "rextio-cuda-runtime/Cargo.toml",
+                "generated/device-providers/rextio-device-cuda/rextio-cuda-runtime/Cargo.toml",
             ),
             generated_helper_ids=("rextio_cuda_runtime_v1",),
             runtime_check_ids=("rextio_cuda_driver_inventory_v1",),

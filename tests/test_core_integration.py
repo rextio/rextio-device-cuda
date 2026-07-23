@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from rextio.artifacts import ArtifactKind, ArtifactProfile
+from rextio.artifacts import ArtifactKind, ArtifactProfile, host_extension_profile
 from rextio.build.orchestrator import _resolve_build_device_plans
 from rextio.devices import (
     DEVICE_PROVIDER_ENTRY_POINT,
@@ -15,14 +15,21 @@ from rextio.devices import (
     resolve_device_plan,
 )
 from rextio_device_cuda.config import CudaProviderConfig
+from rextio_device_cuda.probe import CudaToolkitReport
 from rextio_device_cuda.provider import (
+    CAPABILITY_LIBTORCH_LINUX_X86_64,
     CAPABILITY_LINUX_X86_64,
     PROVIDER_ID,
     CudaDeviceProvider,
 )
 
-from test_provider import FixedRunner, FixedToolkit, probe_report, profile
-from rextio_device_cuda.probe import CudaToolkitReport
+from test_provider import (
+    FixedRunner,
+    FixedToolkit,
+    libtorch_profile,
+    probe_report,
+    profile,
+)
 
 
 @dataclass(frozen=True)
@@ -108,16 +115,44 @@ def test_current_core_rejects_unmaterialized_runtime_contribution() -> None:
         _resolve_build_device_plans(
             (host_profile,),
             selection=selection(),
-            options=DeviceProviderOptions(
-                values=(("device_ordinal", "0"), ("sm", "sm_80"))
-            ),
+            options=DeviceProviderOptions(values=(("device_ordinal", "0"), ("sm", "sm_80"))),
             entry_points=(FakeEntryPoint(ready_provider()),),
         )
 
-def test_missing_production_probe_fails_closed() -> None:
-    provider = CudaDeviceProvider(
-        CudaProviderConfig(device_ordinal=0, sm="sm_80")
+
+def test_current_core_accepts_borrow_only_libtorch_contribution() -> None:
+    framework = libtorch_profile()
+    host_profile = host_extension_profile(
+        framework.target_triple,
+        packaging_backend="cargo",
+        runtime_requirements=framework.runtime_requirements,
+        device_requirements=framework.device_requirements,
     )
+
+    plans = _resolve_build_device_plans(
+        (host_profile,),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_LIBTORCH_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(values=(("device_ordinal", "0"), ("sm", "sm_80"))),
+        entry_points=(FakeEntryPoint(ready_provider()),),
+    )
+
+    assert len(plans) == 1
+    contribution = plans[0].contribution
+    assert contribution.package_references == ()
+    assert contribution.generated_helper_ids == ()
+    assert contribution.runtime_check_ids == ()
+    assert {item.resource_kind for item in contribution.resource_contracts} == {
+        "framework.allocator",
+        "framework.current-stream",
+        "framework.tensor",
+    }
+
+
+def test_missing_production_probe_fails_closed() -> None:
+    provider = CudaDeviceProvider(CudaProviderConfig(device_ordinal=0, sm="sm_80"))
 
     with pytest.raises(DeviceProviderError, match="failed preflight"):
         resolve_device_plan(
@@ -125,6 +160,7 @@ def test_missing_production_probe_fails_closed() -> None:
             selection=selection(),
             providers={PROVIDER_ID: provider},
         )
+
 
 def test_unsupported_target_fails_before_probe() -> None:
     unsupported = profile()
