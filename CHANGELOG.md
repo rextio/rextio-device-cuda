@@ -6,6 +6,12 @@
 - Declare build-only NVIDIA CUDA capabilities for Linux x86_64/AArch64 and
   Windows x86_64.
 - Add explicit, fail-closed target/device/SM and driver preflight.
+- Keep the public `CudaProviderConfig.minimum_driver_version` at or above the
+  manifest's CUDA driver floor (`12000`), and apply that exact floor during
+  preflight so configuration cannot weaken declared compatibility.
+- Keep the public toolkit/runtime requirement at or above CUDA 12.0, reject
+  mismatched toolkit/runtime report versions, and reject unsupported SM
+  architectures even when `preflight()` is called outside Core resolution.
 - Port the reviewed path-safe CUDA Driver API inventory probe.
 - Add optional explicitly rooted toolkit validation.
 - Add a packaged no-dependency Rust crate for provider-owned raw context,

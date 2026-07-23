@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Mapping, Protocol, runtime_checkable
 
+from rextio_device_cuda.config import CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
+
 _PROBE_NAME = "rextio-cuda-driver-probe"
 _PROBE_SCHEMA = "1"
 _MAX_REPORT_BYTES = 65_536
@@ -187,6 +189,10 @@ class CudaToolkitReport:
             or _VERSION_PATTERN.fullmatch(self.runtime_version) is None
         ):
             raise CudaProbeError("TOOLKIT_VERSION_INVALID")
+        if self.version_tuple != self.runtime_version_tuple:
+            raise CudaProbeError("TOOLKIT_RUNTIME_VERSION_MISMATCH")
+        if self.version_tuple[:2] < CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR:
+            raise CudaProbeError("TOOLKIT_VERSION_TOO_OLD")
         if (
             not isinstance(self.components, tuple)
             or not self.components
@@ -208,7 +214,16 @@ class CudaToolkitReport:
     @property
     def version_tuple(self) -> tuple[int, int, int]:
         """Return a comparable semantic version triple."""
-        match = _VERSION_PATTERN.fullmatch(self.version)
+        return self._parse_version(self.version)
+
+    @property
+    def runtime_version_tuple(self) -> tuple[int, int, int]:
+        """Return the runtime version as a comparable semantic triple."""
+        return self._parse_version(self.runtime_version)
+
+    @staticmethod
+    def _parse_version(value: str) -> tuple[int, int, int]:
+        match = _VERSION_PATTERN.fullmatch(value)
         if match is None:
             raise CudaProbeError("TOOLKIT_VERSION_INVALID")
         return (

@@ -14,6 +14,12 @@ semantics.
 - NVIDIA CUDA only.
 - Linux x86_64, Linux AArch64, and Windows x86_64 target declarations.
 - Explicit target capability, device ordinal, and `sm_NN` selection.
+- A fixed minimum CUDA driver floor of `12000` (CUDA 12.0): explicit provider
+  configuration may raise this requirement but cannot lower it beneath the
+  manifest contract.
+- A fixed CUDA toolkit/runtime floor of 12.0: explicit provider configuration
+  may raise it but cannot weaken the manifest, and toolkit/runtime reports must
+  name one identical version at or above that floor.
 - CUDA Driver API inventory through an explicitly configured probe executable.
 - No `PATH`, registry, common-directory, or ambient-environment discovery.
 - Optional validation of an explicitly configured CUDA toolkit root.

@@ -14,9 +14,15 @@ from rextio.devices import (
     DeviceResourceOwner,
     resolve_device_plan,
 )
-from rextio_device_cuda.config import CudaProviderConfig
+from rextio_device_cuda.config import (
+    CUDA_DRIVER_VERSION_FLOOR,
+    CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR,
+    CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT,
+    CudaProviderConfig,
+)
 from rextio_device_cuda.probe import (
     CudaDeviceRecord,
+    CudaProbeError,
     CudaProbeReport,
     CudaToolkitReport,
     ProbeTarget,
@@ -49,7 +55,11 @@ class FixedToolkit:
         return self.report
 
 
-def probe_report(*, sm: str = "sm_80") -> CudaProbeReport:
+def probe_report(
+    *,
+    sm: str = "sm_80",
+    driver_version: int = 12_080,
+) -> CudaProbeReport:
     major = int(sm[3:-1])
     minor = int(sm[-1])
     return CudaProbeReport(
@@ -58,7 +68,7 @@ def probe_report(*, sm: str = "sm_80") -> CudaProbeReport:
         status="probe-complete",
         reason_code=None,
         driver_loaded=True,
-        driver_version=12080,
+        driver_version=driver_version,
         device_count=1,
         cuda_result=0,
         devices=(
@@ -129,8 +139,125 @@ def test_manifest_is_build_only_and_target_bounded() -> None:
     assert {item.certification_tier.value for item in manifest.capabilities} == {
         "build-only"
     }
+    assert {item.minimum_driver_version for item in manifest.capabilities} == {
+        str(CUDA_DRIVER_VERSION_FLOOR)
+    }
+    assert {item.minimum_runtime_version for item in manifest.capabilities} == {
+        CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT
+    }
+    assert CudaProviderConfig().minimum_driver_version == CUDA_DRIVER_VERSION_FLOOR
+    assert (
+        CudaProviderConfig().minimum_toolkit_version
+        == CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
+    )
     assert not hasattr(provider, "claim")
     assert not hasattr(provider, "lower")
+
+
+def test_config_accepts_exact_manifest_driver_floor() -> None:
+    config = CudaProviderConfig(minimum_driver_version=CUDA_DRIVER_VERSION_FLOOR)
+
+    assert config.minimum_driver_version == 12_000
+
+
+@pytest.mark.parametrize("minimum_driver_version", [11_999, 11_000])
+def test_config_rejects_driver_floor_below_manifest(
+    minimum_driver_version: int,
+) -> None:
+    with pytest.raises(ValueError, match="at or above 12000"):
+        CudaProviderConfig(minimum_driver_version=minimum_driver_version)
+
+
+def test_preflight_enforces_the_same_driver_floor_as_manifest() -> None:
+    config = CudaProviderConfig(
+        device_ordinal=0,
+        sm="sm_80",
+        minimum_driver_version=CUDA_DRIVER_VERSION_FLOOR,
+    )
+    exact_floor = CudaDeviceProvider(
+        config,
+        probe_runner=FixedRunner(probe_report(driver_version=CUDA_DRIVER_VERSION_FLOOR)),
+    )
+    below_floor = CudaDeviceProvider(
+        config,
+        probe_runner=FixedRunner(probe_report(driver_version=CUDA_DRIVER_VERSION_FLOOR - 1)),
+    )
+
+    assert exact_floor.preflight(request()).status is DevicePreflightStatus.READY
+    rejected = below_floor.preflight(request())
+    assert rejected.status is DevicePreflightStatus.UNAVAILABLE
+    assert rejected.reason_codes == ("DRIVER_VERSION_TOO_OLD",)
+
+
+def test_config_accepts_exact_manifest_toolkit_runtime_floor() -> None:
+    config = CudaProviderConfig(
+        minimum_toolkit_version=CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
+    )
+
+    assert config.minimum_toolkit_version == (12, 0)
+
+
+@pytest.mark.parametrize("minimum_toolkit_version", [(11, 8), (1, 0)])
+def test_config_rejects_toolkit_floor_below_manifest(
+    minimum_toolkit_version: tuple[int, int],
+) -> None:
+    with pytest.raises(ValueError, match="at or above 12.0"):
+        CudaProviderConfig(minimum_toolkit_version=minimum_toolkit_version)
+
+
+def test_toolkit_report_accepts_exact_manifest_runtime_floor() -> None:
+    report = CudaToolkitReport(
+        version="12.0.0",
+        runtime_version="12.0.0",
+        components=("cuda-header", "cuda-runtime"),
+    )
+
+    assert report.version_tuple[:2] == CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
+    assert report.runtime_version_tuple == report.version_tuple
+
+
+@pytest.mark.parametrize(
+    ("version", "runtime_version", "reason_code"),
+    [
+        ("12.8.0", "1.0.0", "TOOLKIT_RUNTIME_VERSION_MISMATCH"),
+        ("12.8.0", "12.7.0", "TOOLKIT_RUNTIME_VERSION_MISMATCH"),
+        ("11.8.0", "11.8.0", "TOOLKIT_VERSION_TOO_OLD"),
+    ],
+)
+def test_toolkit_report_rejects_mismatch_and_below_floor_versions(
+    version: str,
+    runtime_version: str,
+    reason_code: str,
+) -> None:
+    with pytest.raises(CudaProbeError, match=reason_code):
+        CudaToolkitReport(
+            version=version,
+            runtime_version=runtime_version,
+            components=("cuda-header", "cuda-runtime"),
+        )
+
+
+def test_preflight_accepts_exact_manifest_toolkit_runtime_floor() -> None:
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(
+            device_ordinal=0,
+            sm="sm_80",
+            minimum_driver_version=CUDA_DRIVER_VERSION_FLOOR,
+            minimum_toolkit_version=CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR,
+        ),
+        probe_runner=FixedRunner(
+            probe_report(driver_version=CUDA_DRIVER_VERSION_FLOOR)
+        ),
+        toolkit_inspector=FixedToolkit(
+            CudaToolkitReport(
+                version="12.0.0",
+                runtime_version="12.0.0",
+                components=("cuda-header", "cuda-runtime"),
+            )
+        ),
+    )
+
+    assert provider.preflight(request()).status is DevicePreflightStatus.READY
 
 
 def test_resolve_device_plan_records_path_free_lock_and_resource_boundaries() -> None:
@@ -215,6 +342,18 @@ def test_sm_mismatch_fails_before_build_contribution() -> None:
     assert result.reason_codes == ("CUDA_SM_MISMATCH",)
     with pytest.raises(RuntimeError, match="requires successful preflight"):
         provider.build_contribution(req)
+
+
+def test_direct_preflight_rejects_architecture_outside_manifest() -> None:
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_99"),
+        probe_runner=FixedRunner(probe_report(sm="sm_99")),
+    )
+
+    result = provider.preflight(request(sm="sm_99"))
+
+    assert result.status is DevicePreflightStatus.UNAVAILABLE
+    assert result.reason_codes == ("CUDA_ARCHITECTURE_UNSUPPORTED",)
 
 
 def test_framework_runtime_reuse_is_not_claimed_by_raw_e1_provider() -> None:

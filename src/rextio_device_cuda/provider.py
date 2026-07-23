@@ -28,7 +28,11 @@ from rextio.devices import (
 )
 
 from rextio_device_cuda.__about__ import __version__
-from rextio_device_cuda.config import CudaProviderConfig
+from rextio_device_cuda.config import (
+    CUDA_DRIVER_VERSION_FLOOR,
+    CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT,
+    CudaProviderConfig,
+)
 from rextio_device_cuda.probe import (
     CudaProbeError,
     FilesystemToolkitInspector,
@@ -84,8 +88,8 @@ def _capability(capability_id: str, target_triple: str) -> TargetCapability:
         target_triples=(target_triple,),
         artifact_kinds=_ARTIFACT_KINDS,
         accelerator_backends=("cuda",),
-        minimum_runtime_version="12.0",
-        minimum_driver_version="12000",
+        minimum_runtime_version=CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT,
+        minimum_driver_version=str(CUDA_DRIVER_VERSION_FLOOR),
         architectures=_ARCHITECTURES,
         certification_tier=CertificationTier.BUILD_ONLY,
         evidence_references=_EVIDENCE,
@@ -198,7 +202,10 @@ class CudaDeviceProvider:
                 for capability_id, target in _CAPABILITY_TARGETS.items()
             ),
             runtime_requirements=(
-                RuntimeRequirement(name="nvidia-cuda-driver", version=">=12.0"),
+                RuntimeRequirement(
+                    name="nvidia-cuda-driver",
+                    version=f">={CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT}",
+                ),
             ),
         )
 
@@ -228,6 +235,8 @@ class CudaDeviceProvider:
         try:
             _validate_private_option_keys(request)
             _, required_ordinal, required_sm = _cuda_requirement(request)
+            if required_sm not in _ARCHITECTURES:
+                raise CudaProbeError("CUDA_ARCHITECTURE_UNSUPPORTED")
             probe_path = _coalesce_private_value(
                 _private_option(request, "probe_executable"),
                 str(self._config.probe_path) if self._config.probe_path is not None else None,
@@ -265,6 +274,8 @@ class CudaDeviceProvider:
                 raise CudaProbeError("SM_NOT_CONFIGURED")
             if _SM_PATTERN.fullmatch(selected_sm) is None:
                 raise CudaProbeError("INVALID_SM")
+            if selected_sm not in _ARCHITECTURES:
+                raise CudaProbeError("CUDA_ARCHITECTURE_UNSUPPORTED")
             if ordinal != required_ordinal or selected_sm != required_sm:
                 raise CudaProbeError("DEVICE_REQUIREMENT_MISMATCH")
             expected_probe = expected_probe_target(expected_target)

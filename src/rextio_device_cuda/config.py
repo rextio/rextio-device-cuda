@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+CUDA_DRIVER_VERSION_FLOOR = 12_000
+CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR = (12, 0)
+CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT = ".".join(
+    str(part) for part in CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
+)
+
+
 @dataclass(frozen=True)
 class CudaProviderConfig:
     """Private inputs that are never inferred from ambient process state."""
@@ -14,8 +21,8 @@ class CudaProviderConfig:
     toolkit_root: Path | None = None
     device_ordinal: int | None = None
     sm: str | None = None
-    minimum_driver_version: int = 12_000
-    minimum_toolkit_version: tuple[int, int] = (12, 0)
+    minimum_driver_version: int = CUDA_DRIVER_VERSION_FLOOR
+    minimum_toolkit_version: tuple[int, int] = CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
 
     def __post_init__(self) -> None:
         """Validate bounded configuration without touching the filesystem."""
@@ -35,12 +42,20 @@ class CudaProviderConfig:
         ):
             raise ValueError("sm must use the sm_NN or sm_NNN spelling")
         if type(self.minimum_driver_version) is not int or not (
-            1_000 <= self.minimum_driver_version <= 99_999
+            CUDA_DRIVER_VERSION_FLOOR <= self.minimum_driver_version <= 99_999
         ):
-            raise ValueError("minimum_driver_version must be a bounded CUDA driver integer")
+            raise ValueError(
+                "minimum_driver_version must be a bounded CUDA driver integer "
+                f"at or above {CUDA_DRIVER_VERSION_FLOOR}"
+            )
         if (
             not isinstance(self.minimum_toolkit_version, tuple)
             or len(self.minimum_toolkit_version) != 2
             or any(type(part) is not int or part < 0 or part > 99 for part in self.minimum_toolkit_version)
         ):
             raise ValueError("minimum_toolkit_version must be a (major, minor) integer tuple")
+        if self.minimum_toolkit_version < CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR:
+            raise ValueError(
+                "minimum_toolkit_version must be at or above "
+                f"{CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT}"
+            )
