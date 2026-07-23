@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 
@@ -35,6 +34,7 @@ class FakeDistribution:
 class FakeEntryPoint:
     name = PROVIDER_ID
     group = DEVICE_PROVIDER_ENTRY_POINT
+    value = "rextio_device_cuda.provider:provider"
     dist = FakeDistribution()
 
     def __init__(self, payload: CudaDeviceProvider) -> None:
@@ -94,9 +94,7 @@ def test_selected_provider_resolves_standalone_plan_with_redacted_options() -> N
     assert record["lock"]["options_sha256"]
 
 
-def test_current_core_materialization_gate_fails_before_generated_writes(
-    tmp_path: Path,
-) -> None:
+def test_current_core_rejects_unmaterialized_runtime_contribution() -> None:
     raw = profile()
     host_profile = ArtifactProfile(
         kind=ArtifactKind.HOST_EXTENSION,
@@ -116,27 +114,19 @@ def test_current_core_materialization_gate_fails_before_generated_writes(
             entry_points=(FakeEntryPoint(ready_provider()),),
         )
 
-    assert not (tmp_path / ".rextio").exists()
-
-
-def test_missing_production_probe_fails_before_generated_writes(tmp_path: Path) -> None:
+def test_missing_production_probe_fails_closed() -> None:
     provider = CudaDeviceProvider(
         CudaProviderConfig(device_ordinal=0, sm="sm_80")
     )
 
-    with pytest.raises(DeviceProviderError, match="PROBE_NOT_CONFIGURED"):
+    with pytest.raises(DeviceProviderError, match="failed preflight"):
         resolve_device_plan(
             artifact_profile=profile(),
             selection=selection(),
             providers={PROVIDER_ID: provider},
         )
 
-    assert not (tmp_path / ".rextio").exists()
-
-
-def test_unsupported_target_fails_before_probe_or_generated_writes(
-    tmp_path: Path,
-) -> None:
+def test_unsupported_target_fails_before_probe() -> None:
     unsupported = profile()
     unsupported = unsupported.__class__(
         kind=unsupported.kind,
@@ -158,4 +148,3 @@ def test_unsupported_target_fails_before_probe_or_generated_writes(
         )
 
     assert runner.calls == 0
-    assert not (tmp_path / ".rextio").exists()

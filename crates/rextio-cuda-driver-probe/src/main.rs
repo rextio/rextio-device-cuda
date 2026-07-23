@@ -23,6 +23,8 @@
 use std::ffi::{c_char, c_void};
 use std::fmt::Write as _;
 
+use rextio_cuda_driver_loader::DriverLibrary;
+
 const SCHEMA_VERSION: &str = "1";
 const PROBE_NAME: &str = "rextio-cuda-driver-probe";
 
@@ -338,6 +340,7 @@ fn sanitize_name(value: &str) -> String {
     }
 }
 
+#[cfg(any())]
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod platform {
     use super::*;
@@ -416,6 +419,7 @@ mod platform {
     }
 }
 
+#[cfg(any())]
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -609,7 +613,28 @@ mod platform {
     )
 ))]
 fn run_probe() -> Report {
-    platform::run()
+    let library = match DriverLibrary::load() {
+        Ok(library) => library,
+        Err(error) => return Report::unavailable(error.reason_code(), false),
+    };
+    macro_rules! resolve {
+        ($name:literal, $kind:ty) => {{
+            let pointer = match library.symbol(concat!($name, "\0").as_bytes()) {
+                Ok(pointer) => pointer,
+                Err(error) => return Report::unavailable(error.reason_code(), true),
+            };
+            // SAFETY: the fixed symbol name and type match the CUDA Driver API.
+            unsafe { std::mem::transmute::<*mut c_void, $kind>(pointer.as_ptr()) }
+        }};
+    }
+    inventory(DriverSymbols {
+        init: resolve!("cuInit", CuInit),
+        driver_version: resolve!("cuDriverGetVersion", CuDriverGetVersion),
+        device_count: resolve!("cuDeviceGetCount", CuDeviceGetCount),
+        device_get: resolve!("cuDeviceGet", CuDeviceGet),
+        device_name: resolve!("cuDeviceGetName", CuDeviceGetName),
+        compute_capability: resolve!("cuDeviceComputeCapability", CuDeviceComputeCapability),
+    })
 }
 
 #[cfg(not(any(

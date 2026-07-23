@@ -33,6 +33,8 @@ pub const CUDA_SUCCESS: CuResult = 0;
 
 type CuCtxCreate = unsafe extern "system" fn(*mut CuContext, u32, CuDevice) -> CuResult;
 type CuCtxDestroy = unsafe extern "system" fn(CuContext) -> CuResult;
+type CuCtxPushCurrent = unsafe extern "system" fn(CuContext) -> CuResult;
+type CuCtxPopCurrent = unsafe extern "system" fn(*mut CuContext) -> CuResult;
 type CuStreamCreate = unsafe extern "system" fn(*mut CuStream, u32) -> CuResult;
 type CuStreamDestroy = unsafe extern "system" fn(CuStream) -> CuResult;
 type CuStreamSynchronize = unsafe extern "system" fn(CuStream) -> CuResult;
@@ -88,6 +90,8 @@ fn check(operation: &'static str, result: CuResult) -> Result<(), CudaError> {
 pub struct DriverApi {
     cu_ctx_create: CuCtxCreate,
     cu_ctx_destroy: CuCtxDestroy,
+    cu_ctx_push_current: CuCtxPushCurrent,
+    cu_ctx_pop_current: CuCtxPopCurrent,
     cu_stream_create: CuStreamCreate,
     cu_stream_destroy: CuStreamDestroy,
     cu_stream_synchronize: CuStreamSynchronize,
@@ -107,6 +111,8 @@ impl DriverApi {
     pub unsafe fn from_symbols(
         cu_ctx_create: CuCtxCreate,
         cu_ctx_destroy: CuCtxDestroy,
+        cu_ctx_push_current: CuCtxPushCurrent,
+        cu_ctx_pop_current: CuCtxPopCurrent,
         cu_stream_create: CuStreamCreate,
         cu_stream_destroy: CuStreamDestroy,
         cu_stream_synchronize: CuStreamSynchronize,
@@ -116,6 +122,8 @@ impl DriverApi {
         Self {
             cu_ctx_create,
             cu_ctx_destroy,
+            cu_ctx_push_current,
+            cu_ctx_pop_current,
             cu_stream_create,
             cu_stream_destroy,
             cu_stream_synchronize,
@@ -140,6 +148,26 @@ impl DriverApi {
             operation: "cuCtxCreate_v2:null",
             code: CUDA_SUCCESS,
         })?;
+        let mut popped = std::ptr::null_mut();
+        // cuCtxCreate makes the new context current. Pop it immediately so a
+        // safe constructor restores the caller's prior current-context stack.
+        // SAFETY: output pointer is valid and the function table is trusted.
+        let pop_result = unsafe { (self.cu_ctx_pop_current)(&mut popped) };
+        if pop_result != CUDA_SUCCESS || popped != raw.as_ptr() {
+            // SAFETY: raw came from successful creation; best-effort cleanup is
+            // required even when current-stack restoration failed.
+            unsafe {
+                (self.cu_ctx_destroy)(raw.as_ptr());
+            }
+            return Err(CudaError {
+                operation: if pop_result == CUDA_SUCCESS {
+                    "cuCtxPopCurrent_v2:mismatch"
+                } else {
+                    "cuCtxPopCurrent_v2"
+                },
+                code: pop_result,
+            });
+        }
         Ok(OwnedRawContext {
             inner: Rc::new(ContextInner {
                 api: Arc::clone(self),
@@ -155,12 +183,43 @@ struct ContextInner {
 }
 
 impl ContextInner {
+    fn with_current<T>(
+        &self,
+        operation: impl FnOnce(&DriverApi) -> Result<T, CudaError>,
+    ) -> Result<T, CudaError> {
+        let raw = self.raw.get().ok_or(CudaError {
+            operation: "cuCtxPushCurrent_v2:context-closed",
+            code: CUDA_SUCCESS,
+        })?;
+        // SAFETY: handle is live and this bounded API is same-thread only.
+        check("cuCtxPushCurrent_v2", unsafe {
+            (self.api.cu_ctx_push_current)(raw.as_ptr())
+        })?;
+        let result = operation(&self.api);
+        let mut popped = std::ptr::null_mut();
+        // SAFETY: output pointer is valid and balances the successful push.
+        let pop_result = unsafe { (self.api.cu_ctx_pop_current)(&mut popped) };
+        if pop_result != CUDA_SUCCESS {
+            return Err(CudaError {
+                operation: "cuCtxPopCurrent_v2",
+                code: pop_result,
+            });
+        }
+        if popped != raw.as_ptr() {
+            return Err(CudaError {
+                operation: "cuCtxPopCurrent_v2:mismatch",
+                code: CUDA_SUCCESS,
+            });
+        }
+        result
+    }
+
     fn destroy(&self) -> Result<(), CudaError> {
         let Some(raw) = self.raw.take() else {
             return Ok(());
         };
         // SAFETY: handle came from this API and ContextInner outlives every
-        // provider-owned child through their Arc clones.
+        // provider-owned child through their Rc clones.
         check("cuCtxDestroy_v2", unsafe {
             (self.api.cu_ctx_destroy)(raw.as_ptr())
         })
@@ -206,9 +265,11 @@ impl OwnedRawContext {
             });
         }
         let mut raw = std::ptr::null_mut();
-        // SAFETY: the context and symbol table are live on this same thread.
-        check("cuStreamCreate", unsafe {
-            (self.inner.api.cu_stream_create)(&mut raw, flags)
+        self.inner.with_current(|api| {
+            // SAFETY: with_current installed the owned context for this thread.
+            check("cuStreamCreate", unsafe {
+                (api.cu_stream_create)(&mut raw, flags)
+            })
         })?;
         let raw = NonNull::new(raw).ok_or(CudaError {
             operation: "cuStreamCreate:null",
@@ -235,9 +296,11 @@ impl OwnedRawContext {
             });
         }
         let mut raw = 0;
-        // SAFETY: the context and output pointer are live on this same thread.
-        check("cuMemAlloc_v2", unsafe {
-            (self.inner.api.cu_mem_alloc)(&mut raw, bytes)
+        self.inner.with_current(|api| {
+            // SAFETY: with_current installed the owned context for this thread.
+            check("cuMemAlloc_v2", unsafe {
+                (api.cu_mem_alloc)(&mut raw, bytes)
+            })
         })?;
         if raw == 0 {
             return Err(CudaError {
@@ -288,9 +351,11 @@ impl OwnedRawStream {
             operation: "cuStreamSynchronize:closed",
             code: CUDA_SUCCESS,
         })?;
-        // SAFETY: the stream is still owned and the symbol table remains live.
-        check("cuStreamSynchronize", unsafe {
-            (self.context.api.cu_stream_synchronize)(raw.as_ptr())
+        self.context.with_current(|api| {
+            // SAFETY: with_current installed the owning context.
+            check("cuStreamSynchronize", unsafe {
+                (api.cu_stream_synchronize)(raw.as_ptr())
+            })
         })
     }
 
@@ -303,9 +368,11 @@ impl OwnedRawStream {
         let Some(raw) = self.raw.take() else {
             return Ok(());
         };
-        // SAFETY: handle came from this API and is consumed exactly once.
-        check("cuStreamDestroy_v2", unsafe {
-            (self.context.api.cu_stream_destroy)(raw.as_ptr())
+        self.context.with_current(|api| {
+            // SAFETY: handle came from this context and is consumed once.
+            check("cuStreamDestroy_v2", unsafe {
+                (api.cu_stream_destroy)(raw.as_ptr())
+            })
         })
     }
 }
@@ -354,9 +421,9 @@ impl OwnedRawDeviceAllocation {
         let Some(raw) = self.raw.take() else {
             return Ok(());
         };
-        // SAFETY: address came from this API and is consumed exactly once.
-        check("cuMemFree_v2", unsafe {
-            (self.context.api.cu_mem_free)(raw)
+        self.context.with_current(|api| {
+            // SAFETY: address came from this context and is consumed once.
+            check("cuMemFree_v2", unsafe { (api.cu_mem_free)(raw) })
         })
     }
 }
@@ -377,6 +444,8 @@ mod tests {
     static CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
     static STREAM_DROPS: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATION_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static CONTEXT_PUSHES: AtomicUsize = AtomicUsize::new(0);
+    static CONTEXT_POPS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "system" fn create_context(
         output: *mut CuContext,
@@ -390,6 +459,21 @@ mod tests {
 
     unsafe extern "system" fn destroy_context(_context: CuContext) -> CuResult {
         CONTEXT_DROPS.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn push_context(context: CuContext) -> CuResult {
+        if context.is_null() {
+            return 1;
+        }
+        CONTEXT_PUSHES.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn pop_context(output: *mut CuContext) -> CuResult {
+        CONTEXT_POPS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: test caller supplies the valid output pointer.
+        unsafe { output.write(1_usize as CuContext) };
         CUDA_SUCCESS
     }
 
@@ -425,6 +509,8 @@ mod tests {
             DriverApi::from_symbols(
                 create_context,
                 destroy_context,
+                push_context,
+                pop_context,
                 create_stream,
                 destroy_stream,
                 synchronize_stream,
@@ -440,6 +526,8 @@ mod tests {
         CONTEXT_DROPS.store(0, Ordering::SeqCst);
         STREAM_DROPS.store(0, Ordering::SeqCst);
         ALLOCATION_DROPS.store(0, Ordering::SeqCst);
+        CONTEXT_PUSHES.store(0, Ordering::SeqCst);
+        CONTEXT_POPS.store(0, Ordering::SeqCst);
         let api = api();
         let context = api.create_context(0, 0).unwrap();
         let stream = context.create_dedicated_stream(0).unwrap();
@@ -453,6 +541,8 @@ mod tests {
         assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
         assert_eq!(STREAM_DROPS.load(Ordering::SeqCst), 1);
         assert_eq!(ALLOCATION_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(CONTEXT_PUSHES.load(Ordering::SeqCst), 5);
+        assert_eq!(CONTEXT_POPS.load(Ordering::SeqCst), 6);
     }
 
     #[test]
