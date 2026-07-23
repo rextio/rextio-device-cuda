@@ -6,6 +6,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Mapping, Protocol, runtime_checkable
@@ -14,6 +16,7 @@ _PROBE_NAME = "rextio-cuda-driver-probe"
 _PROBE_SCHEMA = "1"
 _MAX_REPORT_BYTES = 65_536
 _MAX_VERSION_FILE_BYTES = 65_536
+_PROCESS_CLEANUP_SECONDS = 5.0
 _REASON_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SM_PATTERN = re.compile(r"^sm_([0-9]{2,3})$")
 _VERSION_PATTERN = re.compile(r"^([0-9]{1,2})\.([0-9]{1,2})(?:\.([0-9]{1,3}))?$")
@@ -395,9 +398,59 @@ def parse_probe_report(payload: bytes | str) -> CudaProbeReport:
 class SubprocessProbeRunner:
     """Run one explicitly configured probe executable without ``PATH`` lookup."""
 
-    def __init__(self, executable: Path) -> None:
+    def __init__(
+        self,
+        executable: Path,
+        *,
+        arguments: tuple[str, ...] = (),
+        timeout_seconds: float = 10.0,
+    ) -> None:
         """Record an absolute executable path; filesystem checks occur at run time."""
+        if (
+            not isinstance(arguments, tuple)
+            or any(
+                not isinstance(argument, str)
+                or not argument
+                or len(argument) > 4_096
+                or "\x00" in argument
+                for argument in arguments
+            )
+        ):
+            raise ValueError("probe arguments must be bounded non-empty strings")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0 < timeout_seconds <= 60
+        ):
+            raise ValueError("probe timeout must be in (0, 60] seconds")
         self._executable = executable
+        self._arguments = arguments
+        self._timeout_seconds = float(timeout_seconds)
+
+    @staticmethod
+    def _terminate_and_join(
+        process: subprocess.Popen[bytes],
+        reader: threading.Thread,
+    ) -> bool:
+        """Best-effort kill/reap/join without introducing an unbounded wait."""
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+            except subprocess.TimeoutExpired:
+                return False
+        reader.join(timeout=_PROCESS_CLEANUP_SECONDS)
+        return not reader.is_alive()
 
     def run(self) -> CudaProbeReport:
         """Run the probe with a bounded output/time budget and parse its report."""
@@ -416,19 +469,85 @@ class SubprocessProbeRunner:
                 if value:
                     environment[key] = value
         try:
-            completed = subprocess.run(
-                [str(executable)],
-                check=False,
+            process = subprocess.Popen(
+                [str(executable), *self._arguments],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                timeout=10,
                 env=environment,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
             raise CudaProbeError("PROBE_EXECUTION_FAILED") from None
-        if completed.returncode != 0:
+        stdout = process.stdout
+        if stdout is None:
+            try:
+                process.kill()
+                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            raise CudaProbeError("PROBE_EXECUTION_FAILED")
+
+        output = bytearray()
+        overflow = threading.Event()
+        reader_failed = threading.Event()
+
+        def _read_bounded_stdout() -> None:
+            try:
+                while True:
+                    remaining = _MAX_REPORT_BYTES + 1 - len(output)
+                    if remaining <= 0:
+                        overflow.set()
+                        return
+                    chunk = stdout.read(min(8_192, remaining))
+                    if not chunk:
+                        return
+                    output.extend(chunk)
+                    if len(output) > _MAX_REPORT_BYTES:
+                        overflow.set()
+                        return
+            except (OSError, ValueError):
+                reader_failed.set()
+
+        reader = threading.Thread(
+            target=_read_bounded_stdout,
+            name="rextio-cuda-probe-stdout",
+            # The reviewed probe never spawns descendants. Daemonizing still
+            # prevents a hostile descendant retaining stdout from turning a
+            # bounded probe failure into an interpreter-wide deadlock.
+            daemon=True,
+        )
+        reader.start()
+
+        def _cleanup() -> None:
+            if self._terminate_and_join(process, reader):
+                stdout.close()
+
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _cleanup()
+                raise CudaProbeError("PROBE_TIMEOUT")
+            if overflow.wait(timeout=min(0.01, remaining)):
+                _cleanup()
+                raise CudaProbeError("PROBE_OUTPUT_TOO_LARGE")
+            if reader_failed.is_set():
+                _cleanup()
+                raise CudaProbeError("PROBE_EXECUTION_FAILED")
+            return_code = process.poll()
+            if return_code is not None:
+                reader.join(timeout=max(0.0, deadline - time.monotonic()))
+                if reader.is_alive():
+                    _cleanup()
+                    raise CudaProbeError("PROBE_TIMEOUT")
+                break
+        stdout.close()
+        if overflow.is_set():
+            raise CudaProbeError("PROBE_OUTPUT_TOO_LARGE")
+        if reader_failed.is_set():
+            raise CudaProbeError("PROBE_EXECUTION_FAILED")
+        if return_code != 0:
             raise CudaProbeError("PROBE_EXIT_NONZERO")
-        return parse_probe_report(completed.stdout)
+        return parse_probe_report(bytes(output))
 
 
 def expected_probe_target(target_triple: str) -> ProbeTarget:

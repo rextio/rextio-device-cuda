@@ -14,5 +14,8 @@
   ownership surface.
 - Add mocked/build-only CI and manual Linux/Windows NVIDIA inventory plus raw
   RAII lifetime-smoke scripts.
+- Harden the Alpha review boundary with a provider-option allow-list, a
+  64-KiB/timeout-bounded probe reader, dynamic-driver-only linking, explicit
+  driver-image/API drop ordering, and current-context restoration tests.
 
 No tag, public repository, PyPI upload, or CUDA support claim exists yet.

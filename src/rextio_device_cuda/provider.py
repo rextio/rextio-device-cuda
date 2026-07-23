@@ -64,6 +64,9 @@ _CAPABILITY_TARGETS = {
     CAPABILITY_LINUX_AARCH64: "aarch64-unknown-linux-gnu",
     CAPABILITY_WINDOWS_X86_64: "x86_64-pc-windows-msvc",
 }
+_ALLOWED_OPTION_KEYS = frozenset(
+    {"probe_executable", "toolkit_root", "device_ordinal", "sm"}
+)
 _ARTIFACT_KINDS = (
     ArtifactKind.HOST_EXECUTABLE,
     ArtifactKind.HOST_EXTENSION,
@@ -134,6 +137,16 @@ def _private_option(request: DevicePreflightRequest, key: str) -> str | None:
         return None
     value = getter(key)
     return value if isinstance(value, str) else None
+
+
+def _validate_private_option_keys(request: DevicePreflightRequest) -> None:
+    """Reject unknown private inputs before any provider-owned observation."""
+    options = getattr(request, "options", None)
+    keys = getattr(options, "keys", ())
+    if not isinstance(keys, tuple) or any(not isinstance(key, str) for key in keys):
+        raise CudaProbeError("PROVIDER_OPTIONS_INVALID")
+    if set(keys) - _ALLOWED_OPTION_KEYS:
+        raise CudaProbeError("PROVIDER_OPTION_UNKNOWN")
 
 
 def _coalesce_private_value(
@@ -213,6 +226,7 @@ class CudaDeviceProvider:
         if request.artifact_profile.target_triple != expected_target:
             return self._failure("TARGET_MISMATCH", incompatible=True)
         try:
+            _validate_private_option_keys(request)
             _, required_ordinal, required_sm = _cuda_requirement(request)
             probe_path = _coalesce_private_value(
                 _private_option(request, "probe_executable"),
@@ -330,14 +344,7 @@ class CudaDeviceProvider:
             ready = _request_fingerprint(request) in self._ready_requests
         if not ready:
             raise RuntimeError("CUDA provider build contribution requires successful preflight")
-        target_triple = request.artifact_profile.target_triple
-        native_library = (
-            "nvcuda"
-            if target_triple == "x86_64-pc-windows-msvc"
-            else "cuda"
-        )
         return DeviceBuildContribution(
-            native_libraries=(native_library,),
             package_references=(
                 "generated/device-providers/rextio-device-cuda/"
                 "rextio-cuda-runtime/Cargo.toml",

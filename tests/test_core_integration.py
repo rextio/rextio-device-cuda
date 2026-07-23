@@ -86,7 +86,7 @@ def test_selected_provider_resolves_standalone_plan_with_redacted_options() -> N
 
     record = plan.to_dict()
     assert record["manifest"]["provider_id"] == PROVIDER_ID
-    assert record["contribution"]["native_libraries"] == ["cuda"]
+    assert record["contribution"]["native_libraries"] == []
     assert record["contribution"]["package_references"]
     assert record["report"]["certification_tier"] == "build-only"
     assert record["report"]["support_claim"] is False

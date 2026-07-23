@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
-from rextio_device_cuda.probe import CudaProbeError, parse_probe_report
+from rextio_device_cuda.probe import (
+    CudaProbeError,
+    SubprocessProbeRunner,
+    parse_probe_report,
+)
 
 
 def valid_report() -> dict[str, object]:
@@ -74,3 +81,44 @@ def test_parse_probe_report_enforces_output_budget() -> None:
     with pytest.raises(CudaProbeError, match="PROBE_OUTPUT_INVALID"):
         parse_probe_report(b"x" * 65_537)
 
+
+def test_subprocess_runner_reaps_nonzero_probe() -> None:
+    runner = SubprocessProbeRunner(
+        Path(sys.executable),
+        arguments=("-c", "raise SystemExit(7)"),
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(CudaProbeError, match="PROBE_EXIT_NONZERO"):
+        runner.run()
+
+
+def test_subprocess_runner_kills_reaps_and_joins_on_timeout() -> None:
+    runner = SubprocessProbeRunner(
+        Path(sys.executable),
+        arguments=("-c", "import time; time.sleep(30)"),
+        timeout_seconds=0.1,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CudaProbeError, match="PROBE_TIMEOUT"):
+        runner.run()
+
+    assert time.monotonic() - started < 5
+
+
+def test_subprocess_runner_kills_on_max_plus_one_without_buffering_rest() -> None:
+    runner = SubprocessProbeRunner(
+        Path(sys.executable),
+        arguments=(
+            "-c",
+            "import os,time; os.write(1,b'x'*65537); time.sleep(30)",
+        ),
+        timeout_seconds=10,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CudaProbeError, match="PROBE_OUTPUT_TOO_LARGE"):
+        runner.run()
+
+    assert time.monotonic() - started < 5

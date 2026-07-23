@@ -7,4 +7,3 @@ publish = false
 [dependencies]
 rextio-cuda-driver-loader = { path = "../rextio-cuda-driver-loader" }
 rextio-cuda-runtime = { path = "../../src/rextio_device_cuda/rust/rextio-cuda-runtime" }
-

@@ -437,15 +437,17 @@ impl Drop for OwnedRawDeviceAllocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CURRENT_CONTEXT_STACK: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     static CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
     static STREAM_DROPS: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATION_DROPS: AtomicUsize = AtomicUsize::new(0);
     static CONTEXT_PUSHES: AtomicUsize = AtomicUsize::new(0);
     static CONTEXT_POPS: AtomicUsize = AtomicUsize::new(0);
+    static STREAM_CREATE_RESULT: AtomicI32 = AtomicI32::new(CUDA_SUCCESS);
 
     unsafe extern "system" fn create_context(
         output: *mut CuContext,
@@ -454,10 +456,14 @@ mod tests {
     ) -> CuResult {
         // SAFETY: test caller supplies the valid output pointer.
         unsafe { output.write(1_usize as CuContext) };
+        CURRENT_CONTEXT_STACK.lock().unwrap().push(1);
         CUDA_SUCCESS
     }
 
-    unsafe extern "system" fn destroy_context(_context: CuContext) -> CuResult {
+    unsafe extern "system" fn destroy_context(context: CuContext) -> CuResult {
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() == Some(context as usize) {
+            return 11;
+        }
         CONTEXT_DROPS.fetch_add(1, Ordering::SeqCst);
         CUDA_SUCCESS
     }
@@ -466,39 +472,63 @@ mod tests {
         if context.is_null() {
             return 1;
         }
+        CURRENT_CONTEXT_STACK.lock().unwrap().push(context as usize);
         CONTEXT_PUSHES.fetch_add(1, Ordering::SeqCst);
         CUDA_SUCCESS
     }
 
     unsafe extern "system" fn pop_context(output: *mut CuContext) -> CuResult {
         CONTEXT_POPS.fetch_add(1, Ordering::SeqCst);
+        let Some(context) = CURRENT_CONTEXT_STACK.lock().unwrap().pop() else {
+            return 2;
+        };
         // SAFETY: test caller supplies the valid output pointer.
-        unsafe { output.write(1_usize as CuContext) };
+        unsafe { output.write(context as CuContext) };
         CUDA_SUCCESS
     }
 
     unsafe extern "system" fn create_stream(output: *mut CuStream, _flags: u32) -> CuResult {
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() != Some(1) {
+            return 12;
+        }
+        let configured = STREAM_CREATE_RESULT.load(Ordering::SeqCst);
+        if configured != CUDA_SUCCESS {
+            return configured;
+        }
         // SAFETY: test caller supplies the valid output pointer.
         unsafe { output.write(2_usize as CuStream) };
         CUDA_SUCCESS
     }
 
     unsafe extern "system" fn destroy_stream(_stream: CuStream) -> CuResult {
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() != Some(1) {
+            return 13;
+        }
         STREAM_DROPS.fetch_add(1, Ordering::SeqCst);
         CUDA_SUCCESS
     }
 
     unsafe extern "system" fn synchronize_stream(_stream: CuStream) -> CuResult {
-        CUDA_SUCCESS
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() == Some(1) {
+            CUDA_SUCCESS
+        } else {
+            14
+        }
     }
 
     unsafe extern "system" fn allocate(output: *mut CuDevicePtr, _bytes: usize) -> CuResult {
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() != Some(1) {
+            return 15;
+        }
         // SAFETY: test caller supplies the valid output pointer.
         unsafe { output.write(0x1000) };
         CUDA_SUCCESS
     }
 
     unsafe extern "system" fn free(_address: CuDevicePtr) -> CuResult {
+        if CURRENT_CONTEXT_STACK.lock().unwrap().last().copied() != Some(1) {
+            return 16;
+        }
         ALLOCATION_DROPS.fetch_add(1, Ordering::SeqCst);
         CUDA_SUCCESS
     }
@@ -556,6 +586,20 @@ mod tests {
     }
 
     #[test]
+    fn closed_context_value_keeps_api_alive_until_context_drop() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let api = api();
+        let mut context = api.create_context(0, 0).unwrap();
+        assert_eq!(Arc::strong_count(&api), 2);
+
+        context.close().unwrap();
+        assert_eq!(Arc::strong_count(&api), 2);
+        drop(context);
+
+        assert_eq!(Arc::strong_count(&api), 1);
+    }
+
+    #[test]
     fn zero_length_allocation_fails_without_driver_call() {
         let _guard = TEST_LOCK.lock().unwrap();
         let context = api().create_context(0, 0).unwrap();
@@ -596,5 +640,38 @@ mod tests {
         drop(stream);
         context.close().unwrap();
         assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn safe_operations_restore_prior_current_context_even_on_error() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        {
+            let mut stack = CURRENT_CONTEXT_STACK.lock().unwrap();
+            stack.clear();
+            stack.push(99);
+        }
+        STREAM_CREATE_RESULT.store(CUDA_SUCCESS, Ordering::SeqCst);
+        let api = api();
+        let mut context = api.create_context(0, 0).unwrap();
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+
+        let stream = context.create_dedicated_stream(0).unwrap();
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+        let allocation = context.allocate(4096).unwrap();
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+        stream.synchronize().unwrap();
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+
+        STREAM_CREATE_RESULT.store(17, Ordering::SeqCst);
+        let error = context.create_dedicated_stream(0).err().unwrap();
+        assert_eq!(error.code(), 17);
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+        STREAM_CREATE_RESULT.store(CUDA_SUCCESS, Ordering::SeqCst);
+
+        allocation.close().unwrap();
+        stream.close().unwrap();
+        context.close().unwrap();
+        assert_eq!(*CURRENT_CONTEXT_STACK.lock().unwrap(), vec![99]);
+        CURRENT_CONTEXT_STACK.lock().unwrap().clear();
     }
 }

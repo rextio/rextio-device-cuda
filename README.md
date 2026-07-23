@@ -17,8 +17,10 @@ semantics.
 - CUDA Driver API inventory through an explicitly configured probe executable.
 - No `PATH`, registry, common-directory, or ambient-environment discovery.
 - Optional validation of an explicitly configured CUDA toolkit root.
-- Deterministic provider manifest, preflight observations, lock inputs, native
-  link name, resource contracts, and packaged Rust runtime source.
+- Deterministic provider manifest, preflight observations, lock inputs,
+  resource contracts, and packaged Rust runtime source. The runtime resolves
+  the reviewed CUDA Driver image dynamically; generated artifacts do not add a
+  direct `cuda` / `nvcuda` link directive.
 - Provider-owned raw context, dedicated stream, and device-allocation RAII
   primitives. Children keep their context alive and are deliberately
   thread-affine (`!Send` / `!Sync`) in this Alpha.

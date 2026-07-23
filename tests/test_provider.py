@@ -8,6 +8,7 @@ from rextio.artifacts import ArtifactKind, ArtifactProfile, DeviceRequirement
 from rextio.devices import (
     DevicePreflightRequest,
     DevicePreflightStatus,
+    DeviceProviderOptions,
     DeviceProviderSelection,
     DeviceResourceAccess,
     DeviceResourceOwner,
@@ -146,7 +147,7 @@ def test_resolve_device_plan_records_path_free_lock_and_resource_boundaries() ->
     assert plan is not None
     assert plan.preflight.status is DevicePreflightStatus.READY
     assert plan.preflight.support_claim is False
-    assert plan.contribution.native_libraries == ("cuda",)
+    assert plan.contribution.native_libraries == ()
     assert plan.contribution.cargo_features == ()
     assert plan.contribution.package_references == (
         "generated/device-providers/rextio-device-cuda/"
@@ -176,6 +177,32 @@ def test_missing_explicit_probe_fails_closed() -> None:
     assert result.status is DevicePreflightStatus.UNAVAILABLE
     assert result.reason_codes == ("PROBE_NOT_CONFIGURED",)
     assert result.support_claim is False
+
+
+def test_unknown_private_option_fails_before_probe_without_echoing_value() -> None:
+    runner = FixedRunner(probe_report())
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=runner,
+    )
+    req = DevicePreflightRequest(
+        artifact_profile=profile(),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(
+            values=(("unexpected_option", "/private/machine/secret"),)
+        ),
+    )
+
+    result = provider.preflight(req)
+
+    assert result.status is DevicePreflightStatus.UNAVAILABLE
+    assert result.reason_codes == ("PROVIDER_OPTION_UNKNOWN",)
+    assert result.observations == ()
+    assert "/private/machine/secret" not in str(result.to_dict())
+    assert runner.calls == 0
 
 
 def test_sm_mismatch_fails_before_build_contribution() -> None:

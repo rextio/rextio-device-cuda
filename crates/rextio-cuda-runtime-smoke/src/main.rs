@@ -125,6 +125,11 @@ fn run(device_ordinal: i32) -> Result<(), SmokeError> {
         reason_code: "CONTEXT_DESTROY_FAILED",
         cuda_result: Some(error.code()),
     })?;
+    // Preserve the unsafe DriverApi::from_symbols lifetime contract even after
+    // an explicit close: ContextInner owns an Arc<DriverApi>, so the closed
+    // context value must be dropped before the caller's API Arc, and the driver
+    // image must remain loaded until both are gone.
+    drop(context);
     drop(api);
     drop(library);
     Ok(())

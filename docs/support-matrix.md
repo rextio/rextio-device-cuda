@@ -35,3 +35,16 @@ manual-only RAII smoke that resolves the runtime's nine symbols from the same
 reviewed driver image, creates/detaches the context, creates/synchronizes and
 destroys a dedicated stream, allocates/frees 4096 bytes, and closes the
 context. They intentionally do not claim steps 4–7.
+
+Record the immutable source and toolchain identity alongside each manual
+evidence bundle:
+
+```bash
+git rev-parse HEAD
+git -C ../rextio rev-parse HEAD
+rustc +1.93.1 -Vv
+```
+
+Also record the exact Rust target triple, NVIDIA driver version, selected
+device ordinal, and selected `sm_NN`. Do not promote evidence that omits any of
+these fields or that was produced from a dirty worktree.

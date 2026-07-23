@@ -49,6 +49,13 @@ struct Report {
 }
 
 impl Report {
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
     fn unsupported() -> Self {
         Self {
             status: "unsupported",
