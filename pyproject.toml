@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.entry-points."rextio.device_providers"]
-cuda = "rextio_device_cuda.provider:provider"
+rextio-device-cuda = "rextio_device_cuda.provider:provider"
 
 [project.optional-dependencies]
 test = [
@@ -46,6 +46,12 @@ version = {attr = "rextio_device_cuda.__about__.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+rextio_device_cuda = [
+  "rust/rextio-cuda-runtime/Cargo.toml",
+  "rust/rextio-cuda-runtime/src/lib.rs",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -73,4 +79,3 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
-

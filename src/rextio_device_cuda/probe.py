@@ -64,6 +64,18 @@ class ProbeTarget:
     arch: str
     environment: str
 
+    def __post_init__(self) -> None:
+        """Reject unbounded or path-like target identity strings."""
+        for value in (self.os, self.arch, self.environment):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 32
+                or not value.isascii()
+                or not all(character.isalnum() or character in "_-" for character in value)
+            ):
+                raise CudaProbeError("PROBE_SCHEMA_INVALID")
+
 
 @dataclass(frozen=True)
 class CudaDeviceRecord:
@@ -74,6 +86,26 @@ class CudaDeviceRecord:
     compute_major: int
     compute_minor: int
     sm: str
+
+    def __post_init__(self) -> None:
+        """Enforce the same invariants for injected and parsed reports."""
+        if type(self.ordinal) is not int or not 0 <= self.ordinal <= 1_023:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if (
+            not isinstance(self.name, str)
+            or _DEVICE_NAME_PATTERN.fullmatch(self.name) is None
+            or PurePosixPath(self.name).is_absolute()
+            or PureWindowsPath(self.name).is_absolute()
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if (
+            type(self.compute_major) is not int
+            or not 1 <= self.compute_major <= 99
+            or type(self.compute_minor) is not int
+            or not 0 <= self.compute_minor <= 99
+            or self.sm != f"sm_{self.compute_major}{self.compute_minor}"
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
 
 
 @dataclass(frozen=True)
@@ -90,6 +122,50 @@ class CudaProbeReport:
     cuda_result: int | None
     devices: tuple[CudaDeviceRecord, ...]
 
+    def __post_init__(self) -> None:
+        """Keep direct runner injection as strict as parsed subprocess output."""
+        if not isinstance(self.target, ProbeTarget):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if type(self.platform_supported) is not bool or type(self.driver_loaded) is not bool:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.status not in {"probe-complete", "unavailable", "unsupported", "error"}:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.reason_code is not None and _REASON_PATTERN.fullmatch(self.reason_code) is None:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.driver_version is not None and (
+            type(self.driver_version) is not int
+            or not 1_000 <= self.driver_version <= 99_999
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.device_count is not None and (
+            type(self.device_count) is not int or not 0 <= self.device_count <= 1_024
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.cuda_result is not None and (
+            type(self.cuda_result) is not int
+            or not -2_147_483_648 <= self.cuda_result <= 2_147_483_647
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if not isinstance(self.devices, tuple) or any(
+            not isinstance(device, CudaDeviceRecord) for device in self.devices
+        ):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if any(device.ordinal != index for index, device in enumerate(self.devices)):
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        if self.status == "probe-complete":
+            if (
+                self.reason_code is not None
+                or not self.platform_supported
+                or not self.driver_loaded
+                or self.driver_version is None
+                or self.device_count != len(self.devices)
+                or self.device_count == 0
+                or self.cuda_result != 0
+            ):
+                raise CudaProbeError("PROBE_SCHEMA_INVALID")
+        elif self.reason_code is None or self.devices or self.device_count not in {None, 0}:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
+
 
 @dataclass(frozen=True)
 class CudaToolkitReport:
@@ -99,11 +175,39 @@ class CudaToolkitReport:
     runtime_version: str
     components: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        """Validate public construction without relying on parser assertions."""
+        if (
+            not isinstance(self.version, str)
+            or _VERSION_PATTERN.fullmatch(self.version) is None
+            or not isinstance(self.runtime_version, str)
+            or _VERSION_PATTERN.fullmatch(self.runtime_version) is None
+        ):
+            raise CudaProbeError("TOOLKIT_VERSION_INVALID")
+        if (
+            not isinstance(self.components, tuple)
+            or not self.components
+            or any(
+                not isinstance(component, str)
+                or not component
+                or len(component) > 64
+                or not component.isascii()
+                or not all(
+                    character.isalnum() or character in "._-"
+                    for character in component
+                )
+                for component in self.components
+            )
+            or self.components != tuple(sorted(set(self.components)))
+        ):
+            raise CudaProbeError("TOOLKIT_COMPONENT_INVALID")
+
     @property
     def version_tuple(self) -> tuple[int, int, int]:
         """Return a comparable semantic version triple."""
         match = _VERSION_PATTERN.fullmatch(self.version)
-        assert match is not None
+        if match is None:
+            raise CudaProbeError("TOOLKIT_VERSION_INVALID")
         return (
             int(match.group(1)),
             int(match.group(2)),
@@ -230,7 +334,8 @@ def parse_probe_report(payload: bytes | str) -> CudaProbeReport:
         ordinal = _bounded_int(row["ordinal"], minimum=0, maximum=1_023)
         major = _bounded_int(row["compute_major"], minimum=1, maximum=99)
         minor = _bounded_int(row["compute_minor"], minimum=0, maximum=99)
-        assert ordinal is not None and major is not None and minor is not None
+        if ordinal is None or major is None or minor is None:
+            raise CudaProbeError("PROBE_SCHEMA_INVALID")
         name = row["name"]
         sm = row["sm"]
         if (

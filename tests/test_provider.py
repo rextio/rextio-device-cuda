@@ -146,6 +146,16 @@ def test_resolve_device_plan_records_path_free_lock_and_resource_boundaries() ->
     assert plan is not None
     assert plan.preflight.status is DevicePreflightStatus.READY
     assert plan.preflight.support_claim is False
+    assert plan.contribution.native_libraries == ("cuda",)
+    assert plan.contribution.cargo_features == ()
+    assert plan.contribution.package_references == (
+        "generated/device-providers/rextio-device-cuda/"
+        "rextio-cuda-runtime/Cargo.toml",
+    )
+    assert plan.contribution.generated_helper_ids == ("rextio_cuda_runtime_v1",)
+    assert plan.contribution.runtime_check_ids == (
+        "rextio_cuda_driver_inventory_v1",
+    )
     serialized = plan.to_dict()
     assert serialized["report"]["certification_tier"] == "build-only"
     assert serialized["report"]["support_claim"] is False
@@ -208,4 +218,3 @@ def test_framework_runtime_reuse_is_not_claimed_by_raw_e1_provider() -> None:
 
     assert result.status is DevicePreflightStatus.UNAVAILABLE
     assert result.reason_codes == ("FRAMEWORK_RUNTIME_REUSE_UNSUPPORTED",)
-

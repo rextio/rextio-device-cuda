@@ -10,9 +10,11 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// CUDA Driver API result code.
@@ -139,35 +141,93 @@ impl DriverApi {
             code: CUDA_SUCCESS,
         })?;
         Ok(OwnedRawContext {
-            api: Arc::clone(self),
-            raw: Some(raw),
+            inner: Rc::new(ContextInner {
+                api: Arc::clone(self),
+                raw: Cell::new(Some(raw)),
+            }),
         })
     }
+}
 
-    /// Create a provider-owned dedicated stream in the caller's current context.
+struct ContextInner {
+    api: Arc<DriverApi>,
+    raw: Cell<Option<NonNull<c_void>>>,
+}
+
+impl ContextInner {
+    fn destroy(&self) -> Result<(), CudaError> {
+        let Some(raw) = self.raw.take() else {
+            return Ok(());
+        };
+        // SAFETY: handle came from this API and ContextInner outlives every
+        // provider-owned child through their Arc clones.
+        check("cuCtxDestroy_v2", unsafe {
+            (self.api.cu_ctx_destroy)(raw.as_ptr())
+        })
+    }
+}
+
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
+}
+
+/// Provider-owned raw CUDA context, destroyed after every child.
+///
+/// This Alpha is deliberately thread-affine:
+///
+/// ```compile_fail
+/// use rextio_cuda_runtime::OwnedRawContext;
+/// fn require_send<T: Send>() {}
+/// require_send::<OwnedRawContext>();
+/// ```
+pub struct OwnedRawContext {
+    inner: Rc<ContextInner>,
+}
+
+impl OwnedRawContext {
+    /// Non-owning raw handle for provider-generated helper calls.
+    pub fn as_raw(&self) -> CuContext {
+        self.inner
+            .raw
+            .get()
+            .map_or(std::ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    /// Create a provider-owned stream tied to this context's lifetime.
     ///
-    /// This never adopts a framework's current stream.
-    pub fn create_dedicated_stream(
-        self: &Arc<Self>,
-        flags: u32,
-    ) -> Result<OwnedRawStream, CudaError> {
+    /// This is a dedicated provider stream, never a framework current stream.
+    pub fn create_dedicated_stream(&self, flags: u32) -> Result<OwnedRawStream, CudaError> {
+        if self.inner.raw.get().is_none() {
+            return Err(CudaError {
+                operation: "cuStreamCreate:context-closed",
+                code: CUDA_SUCCESS,
+            });
+        }
         let mut raw = std::ptr::null_mut();
-        // SAFETY: same symbol-table invariant as `create_context`.
+        // SAFETY: the context and symbol table are live on this same thread.
         check("cuStreamCreate", unsafe {
-            (self.cu_stream_create)(&mut raw, flags)
+            (self.inner.api.cu_stream_create)(&mut raw, flags)
         })?;
         let raw = NonNull::new(raw).ok_or(CudaError {
             operation: "cuStreamCreate:null",
             code: CUDA_SUCCESS,
         })?;
         Ok(OwnedRawStream {
-            api: Arc::clone(self),
+            context: Rc::clone(&self.inner),
             raw: Some(raw),
         })
     }
 
-    /// Allocate provider-owned raw device memory in the current context.
-    pub fn allocate(self: &Arc<Self>, bytes: usize) -> Result<OwnedRawDeviceAllocation, CudaError> {
+    /// Allocate provider-owned memory tied to this context's lifetime.
+    pub fn allocate(&self, bytes: usize) -> Result<OwnedRawDeviceAllocation, CudaError> {
+        if self.inner.raw.get().is_none() {
+            return Err(CudaError {
+                operation: "cuMemAlloc_v2:context-closed",
+                code: CUDA_SUCCESS,
+            });
+        }
         if bytes == 0 {
             return Err(CudaError {
                 operation: "cuMemAlloc_v2:zero",
@@ -175,9 +235,9 @@ impl DriverApi {
             });
         }
         let mut raw = 0;
-        // SAFETY: output pointer is valid and byte count is nonzero.
+        // SAFETY: the context and output pointer are live on this same thread.
         check("cuMemAlloc_v2", unsafe {
-            (self.cu_mem_alloc)(&mut raw, bytes)
+            (self.inner.api.cu_mem_alloc)(&mut raw, bytes)
         })?;
         if raw == 0 {
             return Err(CudaError {
@@ -186,51 +246,33 @@ impl DriverApi {
             });
         }
         Ok(OwnedRawDeviceAllocation {
-            api: Arc::clone(self),
+            context: Rc::clone(&self.inner),
             raw: Some(raw),
             bytes,
         })
     }
-}
 
-/// Provider-owned raw CUDA context, destroyed exactly once.
-pub struct OwnedRawContext {
-    api: Arc<DriverApi>,
-    raw: Option<NonNull<c_void>>,
-}
-
-impl OwnedRawContext {
-    /// Non-owning raw handle for provider-generated helper calls.
-    pub fn as_raw(&self) -> CuContext {
-        self.raw.map_or(std::ptr::null_mut(), NonNull::as_ptr)
-    }
-
-    /// Destroy now and return any driver error instead of discarding it in Drop.
-    pub fn close(mut self) -> Result<(), CudaError> {
-        self.destroy()
-    }
-
-    fn destroy(&mut self) -> Result<(), CudaError> {
-        let Some(raw) = self.raw.take() else {
-            return Ok(());
-        };
-        // SAFETY: handle came from this API's successful create call and is
-        // consumed exactly once here.
-        check("cuCtxDestroy_v2", unsafe {
-            (self.api.cu_ctx_destroy)(raw.as_ptr())
-        })
-    }
-}
-
-impl Drop for OwnedRawContext {
-    fn drop(&mut self) {
-        let _ = self.destroy();
+    /// Destroy now, but fail while a stream or allocation still owns the context.
+    pub fn close(&mut self) -> Result<(), CudaError> {
+        if Rc::strong_count(&self.inner) != 1 {
+            return Err(CudaError {
+                operation: "cuCtxDestroy_v2:children-live",
+                code: -1,
+            });
+        }
+        self.inner.destroy()
     }
 }
 
 /// Provider-owned dedicated CUDA stream, never a framework current stream.
+///
+/// ```compile_fail
+/// use rextio_cuda_runtime::OwnedRawStream;
+/// fn require_send<T: Send>() {}
+/// require_send::<OwnedRawStream>();
+/// ```
 pub struct OwnedRawStream {
-    api: Arc<DriverApi>,
+    context: Rc<ContextInner>,
     raw: Option<NonNull<c_void>>,
 }
 
@@ -248,7 +290,7 @@ impl OwnedRawStream {
         })?;
         // SAFETY: the stream is still owned and the symbol table remains live.
         check("cuStreamSynchronize", unsafe {
-            (self.api.cu_stream_synchronize)(raw.as_ptr())
+            (self.context.api.cu_stream_synchronize)(raw.as_ptr())
         })
     }
 
@@ -263,7 +305,7 @@ impl OwnedRawStream {
         };
         // SAFETY: handle came from this API and is consumed exactly once.
         check("cuStreamDestroy_v2", unsafe {
-            (self.api.cu_stream_destroy)(raw.as_ptr())
+            (self.context.api.cu_stream_destroy)(raw.as_ptr())
         })
     }
 }
@@ -275,8 +317,14 @@ impl Drop for OwnedRawStream {
 }
 
 /// Provider-owned raw CUDA allocation, freed exactly once.
+///
+/// ```compile_fail
+/// use rextio_cuda_runtime::OwnedRawDeviceAllocation;
+/// fn require_send<T: Send>() {}
+/// require_send::<OwnedRawDeviceAllocation>();
+/// ```
 pub struct OwnedRawDeviceAllocation {
-    api: Arc<DriverApi>,
+    context: Rc<ContextInner>,
     raw: Option<CuDevicePtr>,
     bytes: usize,
 }
@@ -307,7 +355,9 @@ impl OwnedRawDeviceAllocation {
             return Ok(());
         };
         // SAFETY: address came from this API and is consumed exactly once.
-        check("cuMemFree_v2", unsafe { (self.api.cu_mem_free)(raw) })
+        check("cuMemFree_v2", unsafe {
+            (self.context.api.cu_mem_free)(raw)
+        })
     }
 }
 
@@ -321,7 +371,9 @@ impl Drop for OwnedRawDeviceAllocation {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
     static CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
     static STREAM_DROPS: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATION_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -384,13 +436,14 @@ mod tests {
 
     #[test]
     fn owned_resources_release_exactly_once() {
+        let _guard = TEST_LOCK.lock().unwrap();
         CONTEXT_DROPS.store(0, Ordering::SeqCst);
         STREAM_DROPS.store(0, Ordering::SeqCst);
         ALLOCATION_DROPS.store(0, Ordering::SeqCst);
         let api = api();
         let context = api.create_context(0, 0).unwrap();
-        let stream = api.create_dedicated_stream(0).unwrap();
-        let allocation = api.allocate(4096).unwrap();
+        let stream = context.create_dedicated_stream(0).unwrap();
+        let allocation = context.allocate(4096).unwrap();
         assert!(!context.as_raw().is_null());
         assert!(!stream.as_raw().is_null());
         assert_eq!(allocation.as_raw(), 0x1000);
@@ -404,14 +457,54 @@ mod tests {
 
     #[test]
     fn explicit_close_does_not_double_release() {
+        let _guard = TEST_LOCK.lock().unwrap();
         CONTEXT_DROPS.store(0, Ordering::SeqCst);
-        api().create_context(0, 0).unwrap().close().unwrap();
+        let mut context = api().create_context(0, 0).unwrap();
+        context.close().unwrap();
+        drop(context);
         assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn zero_length_allocation_fails_without_driver_call() {
-        let error = api().allocate(0).err().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        let context = api().create_context(0, 0).unwrap();
+        let error = context.allocate(0).err().unwrap();
         assert_eq!(error.operation(), "cuMemAlloc_v2:zero");
+    }
+
+    #[test]
+    fn child_resources_keep_context_alive_and_release_before_it() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        CONTEXT_DROPS.store(0, Ordering::SeqCst);
+        STREAM_DROPS.store(0, Ordering::SeqCst);
+        ALLOCATION_DROPS.store(0, Ordering::SeqCst);
+        let context = api().create_context(0, 0).unwrap();
+        let stream = context.create_dedicated_stream(0).unwrap();
+        let allocation = context.allocate(4096).unwrap();
+
+        drop(context);
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 0);
+        drop(allocation);
+        assert_eq!(ALLOCATION_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 0);
+        drop(stream);
+        assert_eq!(STREAM_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_context_close_fails_while_child_is_live() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        CONTEXT_DROPS.store(0, Ordering::SeqCst);
+        let mut context = api().create_context(0, 0).unwrap();
+        let stream = context.create_dedicated_stream(0).unwrap();
+
+        let error = context.close().unwrap_err();
+        assert_eq!(error.operation(), "cuCtxDestroy_v2:children-live");
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 0);
+        drop(stream);
+        context.close().unwrap();
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
     }
 }

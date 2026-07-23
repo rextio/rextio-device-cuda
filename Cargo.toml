@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/rextio-cuda-driver-probe",
-  "crates/rextio-cuda-runtime",
+  "src/rextio_device_cuda/rust/rextio-cuda-runtime",
 ]
 resolver = "2"
-

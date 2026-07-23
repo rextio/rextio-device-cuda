@@ -186,7 +186,6 @@ class CudaDeviceProvider:
             ),
             runtime_requirements=(
                 RuntimeRequirement(name="nvidia-cuda-driver", version=">=12.0"),
-                RuntimeRequirement(name="nvidia-cuda-toolkit", version=">=12.0"),
             ),
         )
 
@@ -331,14 +330,20 @@ class CudaDeviceProvider:
             ready = _request_fingerprint(request) in self._ready_requests
         if not ready:
             raise RuntimeError("CUDA provider build contribution requires successful preflight")
+        target_triple = request.artifact_profile.target_triple
+        native_library = (
+            "nvcuda"
+            if target_triple == "x86_64-pc-windows-msvc"
+            else "cuda"
+        )
         return DeviceBuildContribution(
-            cargo_features=("cuda-driver",),
-            package_references=("crates/rextio-cuda-runtime/Cargo.toml",),
-            generated_helper_ids=("rextio_cuda_runtime",),
-            runtime_check_ids=(
-                "rextio_cuda_driver_inventory_v1",
-                "rextio_cuda_toolkit_v1",
+            native_libraries=(native_library,),
+            package_references=(
+                "generated/device-providers/rextio-device-cuda/"
+                "rextio-cuda-runtime/Cargo.toml",
             ),
+            generated_helper_ids=("rextio_cuda_runtime_v1",),
+            runtime_check_ids=("rextio_cuda_driver_inventory_v1",),
             resource_contracts=(
                 DeviceResourceContract(
                     resource_kind="raw.cuda.context",

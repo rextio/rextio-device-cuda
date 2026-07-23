@@ -16,7 +16,7 @@ def test_package_and_provider_identity() -> None:
 
 def test_entry_point_factory_shape() -> None:
     entry = EntryPoint(
-        name="cuda",
+        name="rextio-device-cuda",
         value="rextio_device_cuda.provider:provider",
         group="rextio.device_providers",
     )
@@ -24,4 +24,3 @@ def test_entry_point_factory_shape() -> None:
     loaded = entry.load()
 
     assert loaded().__class__.__name__ == "CudaDeviceProvider"
-
