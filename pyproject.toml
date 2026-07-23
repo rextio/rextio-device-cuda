@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==82.0.1", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rextio-device-cuda"
+version = "0.1.0"
+description = "Incubating NVIDIA CUDA device provider for Rextio."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Steve Si-young Song", email = "rextio.co@gmail.com"}
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+  "rextio>=0.1.6,<0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
