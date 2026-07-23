@@ -1,0 +1,417 @@
+//! Provider-owned raw CUDA Driver API resource lifetime primitives.
+//!
+//! This crate intentionally does not wrap framework tensors, allocators,
+//! current streams, or events. PyTorch/TensorFlow adapters must validate and
+//! borrow those framework-owned resources without transferring ownership.
+//!
+//! A caller resolves the exact driver symbols through its reviewed loader,
+//! then constructs [`DriverApi`] once. No symbol search or PATH lookup occurs
+//! in this crate.
+
+#![forbid(unsafe_op_in_unsafe_fn)]
+
+use std::ffi::c_void;
+use std::fmt;
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+/// CUDA Driver API result code.
+pub type CuResult = i32;
+/// CUDA device ordinal.
+pub type CuDevice = i32;
+/// Opaque CUDA context handle.
+pub type CuContext = *mut c_void;
+/// Opaque CUDA stream handle.
+pub type CuStream = *mut c_void;
+/// CUDA device address.
+pub type CuDevicePtr = u64;
+
+/// Successful CUDA Driver API result.
+pub const CUDA_SUCCESS: CuResult = 0;
+
+type CuCtxCreate = unsafe extern "system" fn(*mut CuContext, u32, CuDevice) -> CuResult;
+type CuCtxDestroy = unsafe extern "system" fn(CuContext) -> CuResult;
+type CuStreamCreate = unsafe extern "system" fn(*mut CuStream, u32) -> CuResult;
+type CuStreamDestroy = unsafe extern "system" fn(CuStream) -> CuResult;
+type CuStreamSynchronize = unsafe extern "system" fn(CuStream) -> CuResult;
+type CuMemAlloc = unsafe extern "system" fn(*mut CuDevicePtr, usize) -> CuResult;
+type CuMemFree = unsafe extern "system" fn(CuDevicePtr) -> CuResult;
+
+/// One CUDA Driver API failure without unstable driver text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaError {
+    operation: &'static str,
+    code: CuResult,
+}
+
+impl CudaError {
+    /// Stable operation identifier.
+    pub fn operation(self) -> &'static str {
+        self.operation
+    }
+
+    /// Numeric CUDA result.
+    pub fn code(self) -> CuResult {
+        self.code
+    }
+}
+
+impl fmt::Display for CudaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} failed with CUDA result {}",
+            self.operation, self.code
+        )
+    }
+}
+
+impl std::error::Error for CudaError {}
+
+fn check(operation: &'static str, result: CuResult) -> Result<(), CudaError> {
+    if result == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(CudaError {
+            operation,
+            code: result,
+        })
+    }
+}
+
+/// Exact function table whose lifetime dominates all provider-owned resources.
+///
+/// The dynamic-library owner must retain its library handle for at least as
+/// long as this value and every resource holding an `Arc<DriverApi>`.
+pub struct DriverApi {
+    cu_ctx_create: CuCtxCreate,
+    cu_ctx_destroy: CuCtxDestroy,
+    cu_stream_create: CuStreamCreate,
+    cu_stream_destroy: CuStreamDestroy,
+    cu_stream_synchronize: CuStreamSynchronize,
+    cu_mem_alloc: CuMemAlloc,
+    cu_mem_free: CuMemFree,
+}
+
+impl DriverApi {
+    /// Construct from symbols resolved from one provenance-checked driver image.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must have the exact CUDA Driver API signature shown here.
+    /// The image containing them must remain loaded until the returned API and
+    /// all resources created from it have been dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn from_symbols(
+        cu_ctx_create: CuCtxCreate,
+        cu_ctx_destroy: CuCtxDestroy,
+        cu_stream_create: CuStreamCreate,
+        cu_stream_destroy: CuStreamDestroy,
+        cu_stream_synchronize: CuStreamSynchronize,
+        cu_mem_alloc: CuMemAlloc,
+        cu_mem_free: CuMemFree,
+    ) -> Self {
+        Self {
+            cu_ctx_create,
+            cu_ctx_destroy,
+            cu_stream_create,
+            cu_stream_destroy,
+            cu_stream_synchronize,
+            cu_mem_alloc,
+            cu_mem_free,
+        }
+    }
+
+    /// Create a provider-owned raw context for one validated device ordinal.
+    pub fn create_context(
+        self: &Arc<Self>,
+        device: CuDevice,
+        flags: u32,
+    ) -> Result<OwnedRawContext, CudaError> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: output pointer is valid and the function contract is frozen by
+        // the unsafe `from_symbols` constructor.
+        check("cuCtxCreate_v2", unsafe {
+            (self.cu_ctx_create)(&mut raw, flags, device)
+        })?;
+        let raw = NonNull::new(raw).ok_or(CudaError {
+            operation: "cuCtxCreate_v2:null",
+            code: CUDA_SUCCESS,
+        })?;
+        Ok(OwnedRawContext {
+            api: Arc::clone(self),
+            raw: Some(raw),
+        })
+    }
+
+    /// Create a provider-owned dedicated stream in the caller's current context.
+    ///
+    /// This never adopts a framework's current stream.
+    pub fn create_dedicated_stream(
+        self: &Arc<Self>,
+        flags: u32,
+    ) -> Result<OwnedRawStream, CudaError> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: same symbol-table invariant as `create_context`.
+        check("cuStreamCreate", unsafe {
+            (self.cu_stream_create)(&mut raw, flags)
+        })?;
+        let raw = NonNull::new(raw).ok_or(CudaError {
+            operation: "cuStreamCreate:null",
+            code: CUDA_SUCCESS,
+        })?;
+        Ok(OwnedRawStream {
+            api: Arc::clone(self),
+            raw: Some(raw),
+        })
+    }
+
+    /// Allocate provider-owned raw device memory in the current context.
+    pub fn allocate(self: &Arc<Self>, bytes: usize) -> Result<OwnedRawDeviceAllocation, CudaError> {
+        if bytes == 0 {
+            return Err(CudaError {
+                operation: "cuMemAlloc_v2:zero",
+                code: CUDA_SUCCESS,
+            });
+        }
+        let mut raw = 0;
+        // SAFETY: output pointer is valid and byte count is nonzero.
+        check("cuMemAlloc_v2", unsafe {
+            (self.cu_mem_alloc)(&mut raw, bytes)
+        })?;
+        if raw == 0 {
+            return Err(CudaError {
+                operation: "cuMemAlloc_v2:null",
+                code: CUDA_SUCCESS,
+            });
+        }
+        Ok(OwnedRawDeviceAllocation {
+            api: Arc::clone(self),
+            raw: Some(raw),
+            bytes,
+        })
+    }
+}
+
+/// Provider-owned raw CUDA context, destroyed exactly once.
+pub struct OwnedRawContext {
+    api: Arc<DriverApi>,
+    raw: Option<NonNull<c_void>>,
+}
+
+impl OwnedRawContext {
+    /// Non-owning raw handle for provider-generated helper calls.
+    pub fn as_raw(&self) -> CuContext {
+        self.raw.map_or(std::ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    /// Destroy now and return any driver error instead of discarding it in Drop.
+    pub fn close(mut self) -> Result<(), CudaError> {
+        self.destroy()
+    }
+
+    fn destroy(&mut self) -> Result<(), CudaError> {
+        let Some(raw) = self.raw.take() else {
+            return Ok(());
+        };
+        // SAFETY: handle came from this API's successful create call and is
+        // consumed exactly once here.
+        check("cuCtxDestroy_v2", unsafe {
+            (self.api.cu_ctx_destroy)(raw.as_ptr())
+        })
+    }
+}
+
+impl Drop for OwnedRawContext {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
+}
+
+/// Provider-owned dedicated CUDA stream, never a framework current stream.
+pub struct OwnedRawStream {
+    api: Arc<DriverApi>,
+    raw: Option<NonNull<c_void>>,
+}
+
+impl OwnedRawStream {
+    /// Non-owning raw handle for provider-generated helper calls.
+    pub fn as_raw(&self) -> CuStream {
+        self.raw.map_or(std::ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    /// Synchronize only this provider-owned dedicated stream.
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        let raw = self.raw.ok_or(CudaError {
+            operation: "cuStreamSynchronize:closed",
+            code: CUDA_SUCCESS,
+        })?;
+        // SAFETY: the stream is still owned and the symbol table remains live.
+        check("cuStreamSynchronize", unsafe {
+            (self.api.cu_stream_synchronize)(raw.as_ptr())
+        })
+    }
+
+    /// Destroy now and report a driver error.
+    pub fn close(mut self) -> Result<(), CudaError> {
+        self.destroy()
+    }
+
+    fn destroy(&mut self) -> Result<(), CudaError> {
+        let Some(raw) = self.raw.take() else {
+            return Ok(());
+        };
+        // SAFETY: handle came from this API and is consumed exactly once.
+        check("cuStreamDestroy_v2", unsafe {
+            (self.api.cu_stream_destroy)(raw.as_ptr())
+        })
+    }
+}
+
+impl Drop for OwnedRawStream {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
+}
+
+/// Provider-owned raw CUDA allocation, freed exactly once.
+pub struct OwnedRawDeviceAllocation {
+    api: Arc<DriverApi>,
+    raw: Option<CuDevicePtr>,
+    bytes: usize,
+}
+
+impl OwnedRawDeviceAllocation {
+    /// Raw CUDA device address.
+    pub fn as_raw(&self) -> CuDevicePtr {
+        self.raw.unwrap_or(0)
+    }
+
+    /// Allocation size recorded at successful creation.
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    /// Allocations are never zero length.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Free now and report a driver error.
+    pub fn close(mut self) -> Result<(), CudaError> {
+        self.free()
+    }
+
+    fn free(&mut self) -> Result<(), CudaError> {
+        let Some(raw) = self.raw.take() else {
+            return Ok(());
+        };
+        // SAFETY: address came from this API and is consumed exactly once.
+        check("cuMemFree_v2", unsafe { (self.api.cu_mem_free)(raw) })
+    }
+}
+
+impl Drop for OwnedRawDeviceAllocation {
+    fn drop(&mut self) {
+        let _ = self.free();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static STREAM_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATION_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn create_context(
+        output: *mut CuContext,
+        _flags: u32,
+        _device: CuDevice,
+    ) -> CuResult {
+        // SAFETY: test caller supplies the valid output pointer.
+        unsafe { output.write(1_usize as CuContext) };
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn destroy_context(_context: CuContext) -> CuResult {
+        CONTEXT_DROPS.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn create_stream(output: *mut CuStream, _flags: u32) -> CuResult {
+        // SAFETY: test caller supplies the valid output pointer.
+        unsafe { output.write(2_usize as CuStream) };
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn destroy_stream(_stream: CuStream) -> CuResult {
+        STREAM_DROPS.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn synchronize_stream(_stream: CuStream) -> CuResult {
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn allocate(output: *mut CuDevicePtr, _bytes: usize) -> CuResult {
+        // SAFETY: test caller supplies the valid output pointer.
+        unsafe { output.write(0x1000) };
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "system" fn free(_address: CuDevicePtr) -> CuResult {
+        ALLOCATION_DROPS.fetch_add(1, Ordering::SeqCst);
+        CUDA_SUCCESS
+    }
+
+    fn api() -> Arc<DriverApi> {
+        // SAFETY: each local fake has the declared signature and static lifetime.
+        Arc::new(unsafe {
+            DriverApi::from_symbols(
+                create_context,
+                destroy_context,
+                create_stream,
+                destroy_stream,
+                synchronize_stream,
+                allocate,
+                free,
+            )
+        })
+    }
+
+    #[test]
+    fn owned_resources_release_exactly_once() {
+        CONTEXT_DROPS.store(0, Ordering::SeqCst);
+        STREAM_DROPS.store(0, Ordering::SeqCst);
+        ALLOCATION_DROPS.store(0, Ordering::SeqCst);
+        let api = api();
+        let context = api.create_context(0, 0).unwrap();
+        let stream = api.create_dedicated_stream(0).unwrap();
+        let allocation = api.allocate(4096).unwrap();
+        assert!(!context.as_raw().is_null());
+        assert!(!stream.as_raw().is_null());
+        assert_eq!(allocation.as_raw(), 0x1000);
+        assert_eq!(allocation.len(), 4096);
+        stream.synchronize().unwrap();
+        drop((allocation, stream, context));
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(STREAM_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(ALLOCATION_DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_close_does_not_double_release() {
+        CONTEXT_DROPS.store(0, Ordering::SeqCst);
+        api().create_context(0, 0).unwrap().close().unwrap();
+        assert_eq!(CONTEXT_DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn zero_length_allocation_fails_without_driver_call() {
+        let error = api().allocate(0).err().unwrap();
+        assert_eq!(error.operation(), "cuMemAlloc_v2:zero");
+    }
+}
