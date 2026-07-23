@@ -63,3 +63,12 @@ def test_runtime_loader_lifetime_and_manifest_eof_contracts() -> None:
     assert "The runtime resolves the reviewed CUDA Driver image dynamically" not in readme
     assert manifest.endswith(b"\n")
     assert not manifest.endswith(b"\n\n")
+
+
+def test_framework_reuse_capability_does_not_import_torch() -> None:
+    provider_source = (
+        _ROOT / "src/rextio_device_cuda/provider.py"
+    ).read_text(encoding="utf-8")
+
+    assert "import torch" not in provider_source
+    assert "from torch" not in provider_source

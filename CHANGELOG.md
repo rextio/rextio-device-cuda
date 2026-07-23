@@ -5,6 +5,22 @@
 - Add Device Provider API 1 manifest and exact entry-point identity.
 - Declare build-only NVIDIA CUDA capabilities for Linux x86_64/AArch64 and
   Windows x86_64.
+- Add a distinct build-only Linux x86_64 host-extension-only libtorch
+  runtime-reuse capability for the frozen PyTorch/libtorch 2.11.0 + tch 0.24.0
+  contract. It validates the typed `gpu:0` CUDA requirement and explicit
+  provider SM, then contributes only framework
+  tensor/allocator/current-stream borrow contracts.
+- Keep the libtorch capability free of raw-runtime package references, helper
+  ids, runtime-check ids, provider-owned contexts/allocations/streams, torch
+  imports, one-image ABI claims, and real-GPU support claims.
+- Reject raw-driver-only `toolkit_root` inputs for libtorch reuse through both
+  request options and constructor configuration.
+- Invalidate a prior ready fingerprint before every repeated preflight and use
+  a per-fingerprint generation token so only the newest concurrent successful
+  preflight may restore contribution authority.
+- Record redacted effective driver/toolkit policy floors in ready observations;
+  keep constructor/injected inspection boundaries outside production Core
+  provenance and make no probe-binary content-identity claim.
 - Add explicit, fail-closed target/device/SM and driver preflight.
 - Keep the public `CudaProviderConfig.minimum_driver_version` at or above the
   manifest's CUDA driver floor (`12000`), and apply that exact floor during
@@ -27,4 +43,5 @@
   64-KiB/timeout-bounded probe reader, dynamic-driver-only linking, explicit
   driver-image/API drop ordering, and current-context restoration tests.
 
-No tag, public repository, PyPI upload, or CUDA support claim exists yet.
+No tag, PyPI upload, or CUDA support claim exists yet. The source repository is
+public; all capabilities remain unreleased and build-only.
