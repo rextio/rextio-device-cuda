@@ -400,9 +400,9 @@ mod tests {
 
     #[test]
     fn report_is_path_free_and_never_support_claim() {
-        let json = Report::unsupported().to_json();
+        let json = Report::unavailable("DRIVER_LIBRARY_NOT_FOUND", false).to_json();
         assert!(json.contains("\"support_claim\":false"));
-        assert!(json.contains("\"reason_code\":\"UNSUPPORTED_TARGET\""));
+        assert!(json.contains("\"reason_code\":\"DRIVER_LIBRARY_NOT_FOUND\""));
         assert!(!json.contains(std::env::temp_dir().to_string_lossy().as_ref()));
     }
 
