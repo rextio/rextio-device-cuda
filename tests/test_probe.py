@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -107,6 +108,46 @@ def test_subprocess_runner_kills_reaps_and_joins_on_timeout() -> None:
         runner.run()
 
     assert time.monotonic() - started < 5
+
+
+def test_terminate_process_retries_wait_after_first_timeout() -> None:
+    class TwoStageProcess:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.wait_count = 0
+            self.reaped = False
+
+        def poll(self) -> int | None:
+            self.calls.append("poll")
+            return 0 if self.reaped else None
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+
+        def wait(self, *, timeout: float) -> int:
+            self.calls.append(f"wait:{timeout}")
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
+            self.reaped = True
+            return 0
+
+    process = TwoStageProcess()
+
+    terminated = SubprocessProbeRunner._terminate_process(
+        cast(subprocess.Popen[bytes], process)
+    )
+
+    assert terminated is True
+    assert process.reaped is True
+    assert process.calls == [
+        "poll",
+        "kill",
+        "wait:5.0",
+        "kill",
+        "wait:5.0",
+        "poll",
+    ]
 
 
 def test_subprocess_runner_kills_on_max_plus_one_without_buffering_rest() -> None:

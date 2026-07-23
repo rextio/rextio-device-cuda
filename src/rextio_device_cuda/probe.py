@@ -457,10 +457,10 @@ class SubprocessProbeRunner:
                 process.kill()
             except OSError:
                 pass
-                try:
-                    process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
-                except subprocess.TimeoutExpired:
-                    return False
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+            except subprocess.TimeoutExpired:
+                return False
         return process.poll() is not None
 
     @classmethod
