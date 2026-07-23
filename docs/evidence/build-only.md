@@ -16,3 +16,7 @@ preflight/report has `support_claim=false`.
 The manual-only runtime smoke is compiled but not executed in ordinary CI. Its
 real-driver JSON also fixes `support_claim=false`, `kernel_executed=false`, and
 `certification_ready=false`.
+
+Manual Linux and Windows evidence scripts fail closed unless rustup selects
+exactly rustc/cargo 1.93.1, and use `cargo +1.93.1` for both probe and
+runtime-smoke builds.

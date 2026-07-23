@@ -443,11 +443,8 @@ class SubprocessProbeRunner:
         self._timeout_seconds = float(timeout_seconds)
 
     @staticmethod
-    def _terminate_and_join(
-        process: subprocess.Popen[bytes],
-        reader: threading.Thread,
-    ) -> bool:
-        """Best-effort kill/reap/join without introducing an unbounded wait."""
+    def _terminate_process(process: subprocess.Popen[bytes]) -> bool:
+        """Best-effort kill and reap without introducing an unbounded wait."""
         if process.poll() is None:
             try:
                 process.kill()
@@ -460,10 +457,21 @@ class SubprocessProbeRunner:
                 process.kill()
             except OSError:
                 pass
-            try:
-                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
-            except subprocess.TimeoutExpired:
-                return False
+                try:
+                    process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    return False
+        return process.poll() is not None
+
+    @classmethod
+    def _terminate_and_join(
+        cls,
+        process: subprocess.Popen[bytes],
+        reader: threading.Thread,
+    ) -> bool:
+        """Best-effort kill/reap/join without introducing an unbounded wait."""
+        if not cls._terminate_process(process):
+            return False
         reader.join(timeout=_PROCESS_CLEANUP_SECONDS)
         return not reader.is_alive()
 
@@ -530,7 +538,15 @@ class SubprocessProbeRunner:
             # bounded probe failure into an interpreter-wide deadlock.
             daemon=True,
         )
-        reader.start()
+        try:
+            reader.start()
+        except RuntimeError:
+            self._terminate_process(process)
+            try:
+                stdout.close()
+            except (OSError, ValueError):
+                pass
+            raise CudaProbeError("PROBE_EXECUTION_FAILED") from None
 
         def _cleanup() -> None:
             if self._terminate_and_join(process, reader):

@@ -43,8 +43,13 @@ evidence bundle:
 git rev-parse HEAD
 git -C ../rextio rev-parse HEAD
 rustc +1.93.1 -Vv
+cargo +1.93.1 -V
 ```
 
 Also record the exact Rust target triple, NVIDIA driver version, selected
 device ordinal, and selected `sm_NN`. Do not promote evidence that omits any of
 these fields or that was produced from a dirty worktree.
+
+The Linux and Windows validation scripts require and invoke the exact Rust
+1.93.1 toolchain for both `rustc` and `cargo`; an unavailable or mismatched
+toolchain fails before probe or runtime-smoke execution.

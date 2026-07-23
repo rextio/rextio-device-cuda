@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
+import rextio_device_cuda.probe as probe_module
 from rextio_device_cuda.probe import (
     CudaProbeError,
     SubprocessProbeRunner,
@@ -122,3 +124,34 @@ def test_subprocess_runner_kills_on_max_plus_one_without_buffering_rest() -> Non
         runner.run()
 
     assert time.monotonic() - started < 5
+
+
+def test_subprocess_runner_reaps_process_when_reader_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes: list[subprocess.Popen[bytes]] = []
+    real_popen = probe_module.subprocess.Popen
+
+    def tracked_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_start(_thread: object) -> None:
+        raise RuntimeError("injected thread-start failure")
+
+    monkeypatch.setattr(probe_module.subprocess, "Popen", tracked_popen)
+    monkeypatch.setattr(probe_module.threading.Thread, "start", fail_start)
+    runner = SubprocessProbeRunner(
+        Path(sys.executable),
+        arguments=("-c", "import time; time.sleep(30)"),
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(CudaProbeError, match="PROBE_EXECUTION_FAILED"):
+        runner.run()
+
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout is not None
+    assert processes[0].stdout.closed

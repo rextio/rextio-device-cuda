@@ -12,7 +12,17 @@ $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $Root
 try {
-  cargo build --locked --release `
+  $RustToolchain = "1.93.1"
+  $RustcVersion = (& rustc "+$RustToolchain" --version)
+  if ($LASTEXITCODE -ne 0 -or $RustcVersion -notmatch "^rustc 1\.93\.1 ") {
+    throw "rustc 1.93.1 is required."
+  }
+  $CargoVersion = (& cargo "+$RustToolchain" --version)
+  if ($LASTEXITCODE -ne 0 -or $CargoVersion -notmatch "^cargo 1\.93\.1 ") {
+    throw "cargo 1.93.1 is required."
+  }
+
+  cargo "+$RustToolchain" build --locked --release `
     -p rextio-cuda-driver-probe `
     -p rextio-cuda-runtime-smoke
   $Probe = Join-Path $Root "target\release\rextio-cuda-driver-probe.exe"

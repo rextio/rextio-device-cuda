@@ -12,6 +12,9 @@
 - Keep the public toolkit/runtime requirement at or above CUDA 12.0, reject
   mismatched toolkit/runtime report versions, and reject unsupported SM
   architectures even when `preflight()` is called outside Core resolution.
+- Clarify that the host-owned shared loader must outlive injected runtime
+  symbols and resources, remove the superseded probe-local loaders, pin manual
+  validation to Rust 1.93.1, and reap a probe if stdout-reader startup fails.
 - Port the reviewed path-safe CUDA Driver API inventory probe.
 - Add optional explicitly rooted toolkit validation.
 - Add a packaged no-dependency Rust crate for provider-owned raw context,

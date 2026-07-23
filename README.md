@@ -24,9 +24,11 @@ semantics.
 - No `PATH`, registry, common-directory, or ambient-environment discovery.
 - Optional validation of an explicitly configured CUDA toolkit root.
 - Deterministic provider manifest, preflight observations, lock inputs,
-  resource contracts, and packaged Rust runtime source. The runtime resolves
-  the reviewed CUDA Driver image dynamically; generated artifacts do not add a
-  direct `cuda` / `nvcuda` link directive.
+  resource contracts, and packaged Rust runtime source. A shared driver loader
+  owned by the manual host resolves symbols from one reviewed CUDA Driver
+  image and injects them into the runtime; generated artifacts do not add a
+  direct `cuda` / `nvcuda` link directive. The host must retain that image
+  handle until every injected `DriverApi` and child resource is dropped.
 - Provider-owned raw context, dedicated stream, and device-allocation RAII
   primitives. Children keep their context alive and are deliberately
   thread-affine (`!Send` / `!Sync`) in this Alpha.
@@ -101,13 +103,16 @@ With the unreleased Core 0.1.6 source on `PYTHONPATH`:
 python -m pytest -q
 python -m ruff check src tests
 python -m mypy src
-cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo +1.93.1 fmt --all -- --check
+cargo +1.93.1 test --workspace
+cargo +1.93.1 clippy --workspace --all-targets -- -D warnings
 ```
 
 The packaged runtime source is independently compiled and tested, but Core does
-not yet inject it into generated artifacts.
+not yet inject it into generated artifacts. A future Core materializer must own
+the shared loader, resolve the complete symbol table from one image, and prove
+that the image handle outlives the runtime API, contexts, streams, and
+allocations.
 
 ## Manual NVIDIA inventory
 

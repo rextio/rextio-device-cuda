@@ -20,7 +20,19 @@ OUTPUT="${4:-cuda-inventory-linux.json}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${ROOT}"
 
-cargo build --locked --release \
+RUST_TOOLCHAIN="1.93.1"
+RUSTC_VERSION="$(rustc +"${RUST_TOOLCHAIN}" --version)"
+CARGO_VERSION="$(cargo +"${RUST_TOOLCHAIN}" --version)"
+if [[ "${RUSTC_VERSION}" != "rustc ${RUST_TOOLCHAIN} "* ]]; then
+  echo "rustc ${RUST_TOOLCHAIN} is required." >&2
+  exit 2
+fi
+if [[ "${CARGO_VERSION}" != "cargo ${RUST_TOOLCHAIN} "* ]]; then
+  echo "cargo ${RUST_TOOLCHAIN} is required." >&2
+  exit 2
+fi
+
+cargo +"${RUST_TOOLCHAIN}" build --locked --release \
   -p rextio-cuda-driver-probe \
   -p rextio-cuda-runtime-smoke
 PROBE="${ROOT}/target/release/rextio-cuda-driver-probe"
