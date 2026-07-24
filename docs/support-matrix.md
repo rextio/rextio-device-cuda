@@ -6,6 +6,7 @@ Status: **unreleased build-only Alpha**.
 |---|---|---:|---:|---|
 | Linux x86_64 GNU | build-only | Python/Rust/mock | manual script available | not certified |
 | Linux x86_64 GNU host extension, libtorch 2.11/tch 0.24 reuse | build-only | borrow-only contract | none | not certified |
+| Linux x86_64 GNU host extension, TensorFlow TFE 2.21.0/CPython 3.11 reuse | build-only | borrow-only contract | none | not certified |
 | Linux AArch64 GNU | build-only | cross-check only | manual script available | not certified |
 | Windows x86_64 MSVC | build-only | Python/Rust/mock | manual script available | not certified |
 | macOS arm64/x86_64 | unsupported | fail-closed contract | impossible (CUDA) | unsupported |
@@ -24,6 +25,13 @@ inspect libtorch/ATen images, validate the one-image ABI, execute an operation,
 or provide real-device evidence. Rust-crate and executable artifacts are
 outside this lane. A standalone `toolkit_root` is a raw-driver input and is
 rejected for framework reuse.
+
+The TensorFlow TFE row is likewise a provider prerequisite, not TensorFlow CUDA
+support. It validates the exact `tensorflow-tfe` domain, TensorFlow 2.21.0 and
+CPython 3.11 private eager ABI pins, driver/device/provider-SM inventory, then
+returns only a framework borrow contract. It does not import TensorFlow,
+resolve or validate TFE/private bridge symbols, inspect runtime images, execute
+an operation, claim a current stream, or provide real-device evidence.
 
 ## Remaining certification gate
 
@@ -44,6 +52,12 @@ For the libtorch-reuse capability, promotion additionally requires the Torch E2
 domain work: device-preserving lowering, one-libtorch-image/ABI proof, and a
 real Linux x86_64 GPU vertical slice. Raw-driver E1 certification alone cannot
 promote the framework-reuse row.
+
+For the TensorFlow TFE capability, promotion additionally requires E3 typed
+device-preserving lowering, exact TensorFlow-wheel/private-ABI image identity,
+GPU:0 backing-device and same-context checks, and a real Linux x86_64 GPU
+vertical slice. The evidence must retain `support_claim=false` and
+`certification_ready=false` until a separate owner-approved promotion.
 
 The current manual scripts cover steps 1–3: they run inventory and a separate
 manual-only RAII smoke that resolves the runtime's nine symbols from the same

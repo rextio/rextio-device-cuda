@@ -5,7 +5,11 @@ from pathlib import Path
 
 from rextio.devices import DEVICE_PROVIDER_API_VERSION
 from rextio_device_cuda import __version__
-from rextio_device_cuda.provider import PROVIDER_ID, provider
+from rextio_device_cuda.provider import (
+    CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+    PROVIDER_ID,
+    provider,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +31,20 @@ def test_entry_point_factory_shape() -> None:
     loaded = entry.load()
 
     assert loaded().__class__.__name__ == "CudaDeviceProvider"
+
+
+def test_tensorflow_tfe_capability_is_documented_without_support_claim() -> None:
+    readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    matrix = (_ROOT / "docs/support-matrix.md").read_text(encoding="utf-8")
+    evidence = (_ROOT / "docs/evidence/build-only.md").read_text(encoding="utf-8")
+
+    assert CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64 in readme
+    assert "TensorFlow 2.21.0" in readme
+    assert "support_claim: false" in readme
+    assert "TensorFlow TFE 2.21.0" in matrix
+    assert "not certified" in matrix
+    assert "TensorFlow/TFE" in evidence
+    assert "certification_ready=false" in evidence
 
 
 def test_probe_uses_only_the_shared_driver_loader() -> None:

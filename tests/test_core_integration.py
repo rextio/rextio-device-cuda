@@ -19,6 +19,7 @@ from rextio_device_cuda.probe import CudaToolkitReport
 from rextio_device_cuda.provider import (
     CAPABILITY_LIBTORCH_LINUX_X86_64,
     CAPABILITY_LINUX_X86_64,
+    CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
     PROVIDER_ID,
     CudaDeviceProvider,
 )
@@ -29,6 +30,7 @@ from test_provider import (
     libtorch_profile,
     probe_report,
     profile,
+    tensorflow_tfe_profile,
 )
 
 
@@ -147,6 +149,53 @@ def test_current_core_accepts_borrow_only_libtorch_contribution() -> None:
     assert {item.resource_kind for item in contribution.resource_contracts} == {
         "framework.allocator",
         "framework.current-stream",
+        "framework.tensor",
+    }
+
+
+def test_current_core_accepts_borrow_only_tensorflow_tfe_contribution() -> None:
+    framework = tensorflow_tfe_profile()
+    host_profile = host_extension_profile(
+        framework.target_triple,
+        packaging_backend="cargo",
+        runtime_requirements=framework.runtime_requirements,
+        device_requirements=framework.device_requirements,
+    )
+
+    plans = _resolve_build_device_plans(
+        (host_profile,),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(
+            values=(("device_ordinal", "0"), ("sm", "sm_80"))
+        ),
+        entry_points=(FakeEntryPoint(ready_provider()),),
+    )
+
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan.preflight.support_claim is False
+    assert plan.lowering_authorization() is not None
+    assert plan.lowering_authorization().to_dict() == {
+        "provider_id": PROVIDER_ID,
+        "capability_id": CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        "logical_device": "gpu:0",
+        "backend": "cuda",
+        "runtime": "tensorflow-tfe",
+        "reuse_domain_runtime": True,
+        "features": ["eager", "inference", "no-grad"],
+        "layouts": ["dense"],
+        "memory_spaces": ["device"],
+        "artifact_profile_sha256": plan.lock_record().artifact_profile_sha256,
+    }
+    contribution = plan.contribution
+    assert contribution.package_references == ()
+    assert contribution.generated_helper_ids == ()
+    assert contribution.runtime_check_ids == ()
+    assert {item.resource_kind for item in contribution.resource_contracts} == {
+        "framework.eager-context",
         "framework.tensor",
     }
 
