@@ -46,10 +46,14 @@ CAPABILITY_LINUX_X86_64 = "cuda-linux-x86_64"
 CAPABILITY_LINUX_AARCH64 = "cuda-linux-aarch64"
 CAPABILITY_WINDOWS_X86_64 = "cuda-windows-x86_64"
 CAPABILITY_LIBTORCH_LINUX_X86_64 = "cuda-libtorch-linux-x86_64"
+CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64 = "cuda-tensorflow-tfe-linux-x86_64"
 
 LIBTORCH_RUNTIME = "libtorch"
 LIBTORCH_VERSION = "2.11.0"
 TCH_VERSION = "0.24.0"
+TENSORFLOW_TFE_RUNTIME = "tensorflow-tfe"
+TENSORFLOW_VERSION = "2.21.0"
+CPYTHON_VERSION = "3.11"
 
 _SM_PATTERN = re.compile(r"^sm_[0-9]{2,3}$")
 _ARCHITECTURES = (
@@ -69,12 +73,22 @@ _CAPABILITY_TARGETS = {
     CAPABILITY_LINUX_AARCH64: "aarch64-unknown-linux-gnu",
     CAPABILITY_WINDOWS_X86_64: "x86_64-pc-windows-msvc",
     CAPABILITY_LIBTORCH_LINUX_X86_64: "x86_64-unknown-linux-gnu",
+    CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64: "x86_64-unknown-linux-gnu",
 }
+_FRAMEWORK_RUNTIME_CAPABILITIES = frozenset(
+    {
+        CAPABILITY_LIBTORCH_LINUX_X86_64,
+        CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+    }
+)
 _RAW_ALLOWED_OPTION_KEYS = frozenset({"probe_executable", "toolkit_root", "device_ordinal", "sm"})
 _FRAMEWORK_ALLOWED_OPTION_KEYS = frozenset({"probe_executable", "device_ordinal", "sm"})
 _FRAMEWORK_FEATURES = frozenset({"inference", "no-grad"})
 _FRAMEWORK_LAYOUTS = frozenset({"strided"})
 _FRAMEWORK_MEMORY_SPACES = frozenset({"device"})
+_TENSORFLOW_TFE_FEATURES = frozenset({"eager", "inference", "no-grad"})
+_TENSORFLOW_TFE_LAYOUTS = frozenset({"dense"})
+_TENSORFLOW_TFE_MEMORY_SPACES = frozenset({"device"})
 _ARTIFACT_KINDS = (
     ArtifactKind.HOST_EXECUTABLE,
     ArtifactKind.HOST_EXTENSION,
@@ -114,9 +128,34 @@ def _libtorch_capability() -> TargetCapability:
                 logical_device="gpu:0",
                 backend="cuda",
                 runtime=LIBTORCH_RUNTIME,
-                features=tuple(_FRAMEWORK_FEATURES),
-                layouts=tuple(_FRAMEWORK_LAYOUTS),
-                memory_spaces=tuple(_FRAMEWORK_MEMORY_SPACES),
+                features=tuple(sorted(_FRAMEWORK_FEATURES)),
+                layouts=tuple(sorted(_FRAMEWORK_LAYOUTS)),
+                memory_spaces=tuple(sorted(_FRAMEWORK_MEMORY_SPACES)),
+                reuse_domain_runtime=True,
+            ),
+        ),
+        certification_tier=CertificationTier.BUILD_ONLY,
+        evidence_references=_EVIDENCE,
+    )
+
+
+def _tensorflow_tfe_capability() -> TargetCapability:
+    return TargetCapability(
+        id=CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        target_triples=("x86_64-unknown-linux-gnu",),
+        artifact_kinds=(ArtifactKind.HOST_EXTENSION,),
+        accelerator_backends=("cuda",),
+        minimum_runtime_version=TENSORFLOW_VERSION,
+        minimum_driver_version=str(CUDA_DRIVER_VERSION_FLOOR),
+        architectures=_ARCHITECTURES,
+        device_requirements=(
+            DeviceRequirement(
+                logical_device="gpu:0",
+                backend="cuda",
+                runtime=TENSORFLOW_TFE_RUNTIME,
+                features=tuple(sorted(_TENSORFLOW_TFE_FEATURES)),
+                layouts=tuple(sorted(_TENSORFLOW_TFE_LAYOUTS)),
+                memory_spaces=tuple(sorted(_TENSORFLOW_TFE_MEMORY_SPACES)),
                 reuse_domain_runtime=True,
             ),
         ),
@@ -212,6 +251,59 @@ def _libtorch_cuda_requirement(
     return requirement, device.index, sm
 
 
+def _tensorflow_tfe_cuda_requirement(
+    request: DevicePreflightRequest,
+) -> tuple[DeviceRequirement, int, str | None]:
+    if request.artifact_profile.python_fallback_backend != "cpython":
+        raise CudaProbeError("TENSORFLOW_TFE_CPYTHON_REQUIRED")
+    requirements = request.artifact_profile.device_requirements
+    if len(requirements) != 1:
+        raise CudaProbeError("EXACTLY_ONE_CUDA_DEVICE_REQUIRED")
+    requirement = requirements[0]
+    try:
+        device = normalize_device_id(
+            requirement.logical_device,
+            backend=requirement.backend,
+        )
+    except ValueError as exc:
+        raise CudaProbeError("CUDA_DEVICE_REQUIREMENT_INVALID") from exc
+    if device.kind != "gpu" or device.backend != "cuda" or device.index != 0:
+        raise CudaProbeError("TENSORFLOW_TFE_CUDA_DEVICE_UNSUPPORTED")
+    if requirement.runtime != TENSORFLOW_TFE_RUNTIME:
+        raise CudaProbeError("TENSORFLOW_TFE_RUNTIME_REQUIRED")
+    if not requirement.reuse_domain_runtime:
+        raise CudaProbeError("TENSORFLOW_TFE_RUNTIME_REUSE_REQUIRED")
+    if len(requirement.architectures) > 1:
+        raise CudaProbeError("AT_MOST_ONE_SM_ALLOWED")
+    sm = requirement.architectures[0] if requirement.architectures else None
+    if sm is not None and _SM_PATTERN.fullmatch(sm) is None:
+        raise CudaProbeError("INVALID_SM")
+    if frozenset(requirement.features) != _TENSORFLOW_TFE_FEATURES:
+        raise CudaProbeError("TENSORFLOW_TFE_FEATURES_INCOMPATIBLE")
+    if frozenset(requirement.layouts) != _TENSORFLOW_TFE_LAYOUTS:
+        raise CudaProbeError("TENSORFLOW_TFE_LAYOUT_INCOMPATIBLE")
+    if frozenset(requirement.memory_spaces) != _TENSORFLOW_TFE_MEMORY_SPACES:
+        raise CudaProbeError("TENSORFLOW_TFE_MEMORY_SPACE_INCOMPATIBLE")
+
+    runtime_requirements = {
+        item.name: (item.version, item.features)
+        for item in request.artifact_profile.runtime_requirements
+    }
+    expected_runtime_requirements = {
+        "cpython": (CPYTHON_VERSION, ("private-eager-abi",)),
+        "tensorflow": (
+            TENSORFLOW_VERSION,
+            ("cuda", "python-wheel", "tfe-c-api"),
+        ),
+    }
+    if any(
+        runtime_requirements.get(name) != expected
+        for name, expected in expected_runtime_requirements.items()
+    ):
+        raise CudaProbeError("TENSORFLOW_TFE_RUNTIME_PINS_REQUIRED")
+    return requirement, device.index, sm
+
+
 def _private_option(request: DevicePreflightRequest, key: str) -> str | None:
     """Read an additive API-1 options record without requiring it at import time."""
     options = getattr(request, "options", None)
@@ -285,9 +377,10 @@ class CudaDeviceProvider:
                 *(
                     _capability(capability_id, target)
                     for capability_id, target in _CAPABILITY_TARGETS.items()
-                    if capability_id != CAPABILITY_LIBTORCH_LINUX_X86_64
+                    if capability_id not in _FRAMEWORK_RUNTIME_CAPABILITIES
                 ),
                 _libtorch_capability(),
+                _tensorflow_tfe_capability(),
             ),
             runtime_requirements=(
                 RuntimeRequirement(
@@ -325,15 +418,18 @@ class CudaDeviceProvider:
             return self._failure("CAPABILITY_UNKNOWN", incompatible=True)
         if request.artifact_profile.target_triple != expected_target:
             return self._failure("TARGET_MISMATCH", incompatible=True)
-        framework_runtime_reuse = (
-            request.selection.capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64
-        )
+        capability_id = request.selection.capability_id
+        framework_runtime_reuse = capability_id in _FRAMEWORK_RUNTIME_CAPABILITIES
         if (
             framework_runtime_reuse
             and request.artifact_profile.kind is not ArtifactKind.HOST_EXTENSION
         ):
             return self._failure(
-                "LIBTORCH_ARTIFACT_KIND_UNSUPPORTED",
+                (
+                    "LIBTORCH_ARTIFACT_KIND_UNSUPPORTED"
+                    if capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64
+                    else "TENSORFLOW_TFE_ARTIFACT_KIND_UNSUPPORTED"
+                ),
                 incompatible=True,
             )
         try:
@@ -346,9 +442,17 @@ class CudaDeviceProvider:
                 ),
             )
             if framework_runtime_reuse and self._config.toolkit_root is not None:
-                raise CudaProbeError("LIBTORCH_TOOLKIT_ROOT_UNSUPPORTED")
-            if framework_runtime_reuse:
+                raise CudaProbeError(
+                    "LIBTORCH_TOOLKIT_ROOT_UNSUPPORTED"
+                    if capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64
+                    else "TENSORFLOW_TFE_TOOLKIT_ROOT_UNSUPPORTED"
+                )
+            if capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64:
                 _, required_ordinal, required_sm = _libtorch_cuda_requirement(request)
+            elif capability_id == CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64:
+                _, required_ordinal, required_sm = _tensorflow_tfe_cuda_requirement(
+                    request
+                )
             else:
                 _, required_ordinal, required_sm = _raw_cuda_requirement(request)
             if required_sm is not None and required_sm not in _ARCHITECTURES:
@@ -440,12 +544,21 @@ class CudaDeviceProvider:
             ("target.arch", report.target.arch),
             ("target.os", report.target.os),
         ]
-        if framework_runtime_reuse:
+        if capability_id == CAPABILITY_LIBTORCH_LINUX_X86_64:
             observations.extend(
                 (
                     ("framework.runtime", LIBTORCH_RUNTIME),
                     ("framework.runtime-pin", LIBTORCH_VERSION),
                     ("framework.binding-pin", TCH_VERSION),
+                    ("framework.reuse", "required-unverified"),
+                )
+            )
+        elif capability_id == CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64:
+            observations.extend(
+                (
+                    ("framework.runtime", TENSORFLOW_TFE_RUNTIME),
+                    ("framework.runtime-pin", TENSORFLOW_VERSION),
+                    ("framework.binding-pin", f"cpython-{CPYTHON_VERSION}-private-eager-abi"),
                     ("framework.reuse", "required-unverified"),
                 )
             )
@@ -514,6 +627,24 @@ class CudaDeviceProvider:
                     ),
                     DeviceResourceContract(
                         resource_kind="framework.current-stream",
+                        owner=DeviceResourceOwner.FRAMEWORK,
+                        access=DeviceResourceAccess.BORROW_VALIDATE,
+                    ),
+                ),
+            )
+        if (
+            request.selection.capability_id
+            == CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64
+        ):
+            return DeviceBuildContribution(
+                resource_contracts=(
+                    DeviceResourceContract(
+                        resource_kind="framework.tensor",
+                        owner=DeviceResourceOwner.FRAMEWORK,
+                        access=DeviceResourceAccess.BORROW_VALIDATE,
+                    ),
+                    DeviceResourceContract(
+                        resource_kind="framework.eager-context",
                         owner=DeviceResourceOwner.FRAMEWORK,
                         access=DeviceResourceAccess.BORROW_VALIDATE,
                     ),

@@ -13,6 +13,15 @@
 - Keep the libtorch capability free of raw-runtime package references, helper
   ids, runtime-check ids, provider-owned contexts/allocations/streams, torch
   imports, one-image ABI claims, and real-GPU support claims.
+- Add a distinct build-only Linux x86_64 host-extension-only
+  `cuda-tensorflow-tfe-linux-x86_64` prerequisite for the frozen
+  TensorFlow 2.21.0 + CPython 3.11 private eager ABI contract. It validates the
+  exact typed `gpu:0` dense device requirement and explicit provider SM, then
+  contributes only framework borrow/validate contracts.
+- Keep the TensorFlow TFE capability free of raw CUDA resources, current-stream
+  or event claims, native libraries, package references, helpers, runtime
+  checks, TensorFlow imports, TFE/private-ABI image claims, real-GPU execution,
+  support claims, and certification claims.
 - Reject raw-driver-only `toolkit_root` inputs for libtorch reuse through both
   request options and constructor configuration.
 - Invalidate a prior ready fingerprint before every repeated preflight and use

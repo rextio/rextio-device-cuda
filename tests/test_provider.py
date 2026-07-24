@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +41,14 @@ from rextio_device_cuda.probe import (
 from rextio_device_cuda.provider import (
     CAPABILITY_LIBTORCH_LINUX_X86_64,
     CAPABILITY_LINUX_X86_64,
+    CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+    CPYTHON_VERSION,
     LIBTORCH_RUNTIME,
     LIBTORCH_VERSION,
     PROVIDER_ID,
     TCH_VERSION,
+    TENSORFLOW_TFE_RUNTIME,
+    TENSORFLOW_VERSION,
     CudaDeviceProvider,
 )
 
@@ -208,6 +215,68 @@ def libtorch_request(
     )
 
 
+def tensorflow_tfe_profile(
+    *,
+    architectures: tuple[str, ...] = (),
+    logical_device: str = "gpu:0",
+    backend: str = "cuda",
+    runtime: str = TENSORFLOW_TFE_RUNTIME,
+    features: tuple[str, ...] = ("eager", "inference", "no-grad"),
+    layouts: tuple[str, ...] = ("dense",),
+    memory_spaces: tuple[str, ...] = ("device",),
+    reuse_domain_runtime: bool = True,
+    python_fallback_backend: str | None = "cpython",
+    runtime_requirements: tuple[RuntimeRequirement, ...] | None = None,
+) -> ArtifactProfile:
+    return ArtifactProfile(
+        kind=ArtifactKind.HOST_EXTENSION,
+        target_triple="x86_64-unknown-linux-gnu",
+        packaging_backend="cargo",
+        python_fallback_backend=python_fallback_backend,
+        runtime_requirements=(
+            runtime_requirements
+            if runtime_requirements is not None
+            else (
+                RuntimeRequirement(
+                    "tensorflow",
+                    TENSORFLOW_VERSION,
+                    ("cuda", "python-wheel", "tfe-c-api"),
+                ),
+                RuntimeRequirement(
+                    "cpython",
+                    CPYTHON_VERSION,
+                    ("private-eager-abi",),
+                ),
+            )
+        ),
+        device_requirements=(
+            DeviceRequirement(
+                logical_device=logical_device,
+                backend=backend,
+                runtime=runtime,
+                features=features,
+                layouts=layouts,
+                memory_spaces=memory_spaces,
+                architectures=architectures,
+                reuse_domain_runtime=reuse_domain_runtime,
+            ),
+        ),
+    )
+
+
+def tensorflow_tfe_request(
+    *,
+    artifact_profile: ArtifactProfile | None = None,
+) -> DevicePreflightRequest:
+    return DevicePreflightRequest(
+        artifact_profile=artifact_profile or tensorflow_tfe_profile(),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        ),
+    )
+
+
 def configured_provider(*, report_sm: str = "sm_80") -> CudaDeviceProvider:
     return CudaDeviceProvider(
         CudaProviderConfig(device_ordinal=0, sm="sm_80"),
@@ -232,6 +301,7 @@ def test_manifest_is_build_only_and_target_bounded() -> None:
         "cuda-libtorch-linux-x86_64",
         "cuda-linux-aarch64",
         "cuda-linux-x86_64",
+        "cuda-tensorflow-tfe-linux-x86_64",
         "cuda-windows-x86_64",
     }
     assert {item.certification_tier.value for item in manifest.capabilities} == {"build-only"}
@@ -241,6 +311,7 @@ def test_manifest_is_build_only_and_target_bounded() -> None:
     assert {item.minimum_runtime_version for item in manifest.capabilities} == {
         CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR_TEXT,
         LIBTORCH_VERSION,
+        TENSORFLOW_VERSION,
     }
     libtorch_capability = next(
         item for item in manifest.capabilities if item.id == CAPABILITY_LIBTORCH_LINUX_X86_64
@@ -260,10 +331,61 @@ def test_manifest_is_build_only_and_target_bounded() -> None:
             "reuse_domain_runtime": True,
         },
     )
+    tensorflow_capability = next(
+        item
+        for item in manifest.capabilities
+        if item.id == CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64
+    )
+    assert tensorflow_capability.artifact_kinds == (ArtifactKind.HOST_EXTENSION,)
+    assert tuple(
+        requirement.to_dict()
+        for requirement in tensorflow_capability.device_requirements
+    ) == (
+        {
+            "logical_device": "gpu:0",
+            "backend": "cuda",
+            "runtime": "tensorflow-tfe",
+            "features": ["eager", "inference", "no-grad"],
+            "layouts": ["dense"],
+            "memory_spaces": ["device"],
+            "architectures": [],
+            "reuse_domain_runtime": True,
+        },
+    )
     assert CudaProviderConfig().minimum_driver_version == CUDA_DRIVER_VERSION_FLOOR
     assert CudaProviderConfig().minimum_toolkit_version == CUDA_TOOLKIT_RUNTIME_VERSION_FLOOR
     assert not hasattr(provider, "claim")
     assert not hasattr(provider, "lower")
+
+
+def test_manifest_serialization_is_stable_across_python_hash_seeds() -> None:
+    command = (
+        "import json; "
+        "from rextio_device_cuda.provider import CudaDeviceProvider; "
+        "print(json.dumps(CudaDeviceProvider().manifest().to_dict(), "
+        "sort_keys=True, separators=(',', ':')))"
+    )
+    outputs = []
+    for seed in ("1", "777"):
+        environment = dict(os.environ)
+        environment["PYTHONHASHSEED"] = seed
+        root = Path(__file__).resolve().parents[1]
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(
+                None,
+                (str(root / "src"), environment.get("PYTHONPATH")),
+            )
+        )
+        outputs.append(
+            subprocess.check_output(
+                [sys.executable, "-c", command],
+                cwd=root,
+                env=environment,
+                text=True,
+            )
+        )
+
+    assert outputs[0] == outputs[1]
 
 
 def test_config_accepts_exact_manifest_driver_floor() -> None:
@@ -754,6 +876,311 @@ def test_libtorch_capability_rejects_constructor_toolkit_root_before_probe() -> 
     assert result.status is DevicePreflightStatus.UNAVAILABLE
     assert result.reason_codes == ("LIBTORCH_TOOLKIT_ROOT_UNSUPPORTED",)
     assert runner.calls == 0
+
+
+def test_tensorflow_tfe_runtime_reuse_is_a_separate_build_only_capability() -> None:
+    result = configured_provider().preflight(tensorflow_tfe_request())
+
+    assert result.status is DevicePreflightStatus.READY
+    assert result.support_claim is False
+    assert ("framework.runtime", "tensorflow-tfe") in result.observations
+    assert ("framework.runtime-pin", "2.21.0") in result.observations
+    assert (
+        "framework.binding-pin",
+        "cpython-3.11-private-eager-abi",
+    ) in result.observations
+    assert ("framework.reuse", "required-unverified") in result.observations
+    assert not any(key.startswith("toolkit.") for key, _ in result.observations)
+    assert not any(key == "policy.minimum-toolkit-version" for key, _ in result.observations)
+
+
+def test_tensorflow_tfe_runtime_reuse_may_cross_check_one_domain_sm() -> None:
+    provider = configured_provider()
+
+    accepted = provider.preflight(
+        tensorflow_tfe_request(
+            artifact_profile=tensorflow_tfe_profile(architectures=("sm_80",))
+        )
+    )
+    rejected = provider.preflight(
+        tensorflow_tfe_request(
+            artifact_profile=tensorflow_tfe_profile(architectures=("sm_90",))
+        )
+    )
+
+    assert accepted.status is DevicePreflightStatus.READY
+    assert rejected.status is DevicePreflightStatus.UNAVAILABLE
+    assert rejected.reason_codes == ("DEVICE_REQUIREMENT_MISMATCH",)
+
+
+def test_tensorflow_tfe_contribution_only_borrows_framework_resources() -> None:
+    provider = configured_provider()
+    req = tensorflow_tfe_request()
+    assert provider.preflight(req).status is DevicePreflightStatus.READY
+
+    contribution = provider.build_contribution(req)
+
+    assert contribution.cargo_features == ()
+    assert contribution.native_libraries == ()
+    assert contribution.package_references == ()
+    assert contribution.generated_helper_ids == ()
+    assert contribution.runtime_check_ids == ()
+    assert {resource.resource_kind for resource in contribution.resource_contracts} == {
+        "framework.eager-context",
+        "framework.tensor",
+    }
+    assert all(
+        resource.owner is DeviceResourceOwner.FRAMEWORK
+        and resource.access is DeviceResourceAccess.BORROW_VALIDATE
+        and not resource.may_allocate
+        and not resource.may_replace
+        and not resource.may_synchronize
+        for resource in contribution.resource_contracts
+    )
+    assert not any(
+        resource.resource_kind
+        in {
+            "framework.allocator",
+            "framework.current-stream",
+            "framework.event",
+            "framework.executor",
+        }
+        or resource.resource_kind.startswith("raw.cuda.")
+        for resource in contribution.resource_contracts
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_profile", "reason_code"),
+    [
+        (
+            tensorflow_tfe_profile(logical_device="gpu:1"),
+            "TENSORFLOW_TFE_CUDA_DEVICE_UNSUPPORTED",
+        ),
+        (
+            tensorflow_tfe_profile(backend="rocm"),
+            "TENSORFLOW_TFE_CUDA_DEVICE_UNSUPPORTED",
+        ),
+        (
+            tensorflow_tfe_profile(runtime="tensorflow"),
+            "TENSORFLOW_TFE_RUNTIME_REQUIRED",
+        ),
+        (
+            tensorflow_tfe_profile(reuse_domain_runtime=False),
+            "TENSORFLOW_TFE_RUNTIME_REUSE_REQUIRED",
+        ),
+        (
+            tensorflow_tfe_profile(python_fallback_backend="nuitka"),
+            "TENSORFLOW_TFE_CPYTHON_REQUIRED",
+        ),
+        (
+            tensorflow_tfe_profile(features=("inference", "no-grad")),
+            "TENSORFLOW_TFE_FEATURES_INCOMPATIBLE",
+        ),
+        (
+            tensorflow_tfe_profile(layouts=("strided",)),
+            "TENSORFLOW_TFE_LAYOUT_INCOMPATIBLE",
+        ),
+        (
+            tensorflow_tfe_profile(memory_spaces=("host",)),
+            "TENSORFLOW_TFE_MEMORY_SPACE_INCOMPATIBLE",
+        ),
+        (
+            tensorflow_tfe_profile(architectures=("sm_80", "sm_90")),
+            "AT_MOST_ONE_SM_ALLOWED",
+        ),
+        (
+            tensorflow_tfe_profile(architectures=("sm_99",)),
+            "CUDA_ARCHITECTURE_UNSUPPORTED",
+        ),
+        (
+            tensorflow_tfe_profile(
+                runtime_requirements=(
+                    RuntimeRequirement(
+                        "tensorflow",
+                        "2.20.0",
+                        ("cuda", "python-wheel", "tfe-c-api"),
+                    ),
+                    RuntimeRequirement(
+                        "cpython",
+                        CPYTHON_VERSION,
+                        ("private-eager-abi",),
+                    ),
+                )
+            ),
+            "TENSORFLOW_TFE_RUNTIME_PINS_REQUIRED",
+        ),
+        (
+            tensorflow_tfe_profile(
+                runtime_requirements=(
+                    RuntimeRequirement(
+                        "tensorflow",
+                        TENSORFLOW_VERSION,
+                        ("cuda", "python-wheel", "tfe-c-api"),
+                    ),
+                    RuntimeRequirement("cpython", "3.12", ("private-eager-abi",)),
+                )
+            ),
+            "TENSORFLOW_TFE_RUNTIME_PINS_REQUIRED",
+        ),
+    ],
+)
+def test_tensorflow_tfe_capability_rejects_non_frozen_framework_contract(
+    artifact_profile: ArtifactProfile,
+    reason_code: str,
+) -> None:
+    result = configured_provider().preflight(
+        tensorflow_tfe_request(artifact_profile=artifact_profile)
+    )
+
+    assert result.status is DevicePreflightStatus.UNAVAILABLE
+    assert result.reason_codes == (reason_code,)
+
+
+def test_tensorflow_tfe_capability_allows_unrelated_runtime_rows() -> None:
+    profile_with_packaging_runtime = tensorflow_tfe_profile(
+        runtime_requirements=(
+            RuntimeRequirement(
+                "tensorflow",
+                TENSORFLOW_VERSION,
+                ("cuda", "python-wheel", "tfe-c-api"),
+            ),
+            RuntimeRequirement(
+                "cpython",
+                CPYTHON_VERSION,
+                ("private-eager-abi",),
+            ),
+            RuntimeRequirement("packaging-runtime", "1"),
+        )
+    )
+
+    result = configured_provider().preflight(
+        tensorflow_tfe_request(artifact_profile=profile_with_packaging_runtime)
+    )
+
+    assert result.status is DevicePreflightStatus.READY
+
+
+def test_tensorflow_tfe_capability_requires_exactly_one_device_requirement() -> None:
+    valid = tensorflow_tfe_profile()
+    duplicate = ArtifactProfile(
+        kind=valid.kind,
+        target_triple=valid.target_triple,
+        packaging_backend=valid.packaging_backend,
+        python_fallback_backend=valid.python_fallback_backend,
+        runtime_requirements=valid.runtime_requirements,
+        device_requirements=(*valid.device_requirements, DeviceRequirement("cpu")),
+    )
+
+    result = configured_provider().preflight(
+        tensorflow_tfe_request(artifact_profile=duplicate)
+    )
+
+    assert result.status is DevicePreflightStatus.UNAVAILABLE
+    assert result.reason_codes == ("EXACTLY_ONE_CUDA_DEVICE_REQUIRED",)
+
+
+def test_tensorflow_tfe_capability_rejects_toolkit_inputs_before_probe() -> None:
+    runner = FixedRunner(probe_report())
+    request_provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=runner,
+    )
+    with_option = DevicePreflightRequest(
+        artifact_profile=tensorflow_tfe_profile(),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(values=(("toolkit_root", "/opt/cuda"),)),
+    )
+
+    option_result = request_provider.preflight(with_option)
+    constructor_result = CudaDeviceProvider(
+        CudaProviderConfig(
+            toolkit_root=Path("/opt/cuda"),
+            device_ordinal=0,
+            sm="sm_80",
+        ),
+        probe_runner=runner,
+    ).preflight(tensorflow_tfe_request())
+
+    assert option_result.reason_codes == ("PROVIDER_OPTION_UNKNOWN",)
+    assert constructor_result.reason_codes == (
+        "TENSORFLOW_TFE_TOOLKIT_ROOT_UNSUPPORTED",
+    )
+    assert runner.calls == 0
+
+
+def test_tensorflow_tfe_capability_rejects_non_extension_before_probe() -> None:
+    valid = tensorflow_tfe_profile()
+    rust_crate = ArtifactProfile(
+        kind=ArtifactKind.RUST_CRATE,
+        target_triple=valid.target_triple,
+        packaging_backend="cargo",
+        runtime_requirements=valid.runtime_requirements,
+        device_requirements=valid.device_requirements,
+    )
+    runner = FixedRunner(probe_report())
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=runner,
+    )
+
+    result = provider.preflight(
+        tensorflow_tfe_request(artifact_profile=rust_crate)
+    )
+
+    assert result.status is DevicePreflightStatus.INCOMPATIBLE
+    assert result.reason_codes == ("TENSORFLOW_TFE_ARTIFACT_KIND_UNSUPPORTED",)
+    assert runner.calls == 0
+
+
+def test_tensorflow_tfe_requires_explicit_sm_and_exact_target_before_probe() -> None:
+    missing_sm_runner = FixedRunner(probe_report())
+    missing_sm = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0),
+        probe_runner=missing_sm_runner,
+    ).preflight(tensorflow_tfe_request())
+
+    valid = tensorflow_tfe_profile()
+    wrong_target = ArtifactProfile(
+        kind=valid.kind,
+        target_triple="x86_64-pc-windows-msvc",
+        packaging_backend=valid.packaging_backend,
+        python_fallback_backend=valid.python_fallback_backend,
+        runtime_requirements=valid.runtime_requirements,
+        device_requirements=valid.device_requirements,
+    )
+    wrong_target_runner = FixedRunner(probe_report())
+    target_result = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=wrong_target_runner,
+    ).preflight(tensorflow_tfe_request(artifact_profile=wrong_target))
+
+    assert missing_sm.reason_codes == ("SM_NOT_CONFIGURED",)
+    assert missing_sm_runner.calls == 0
+    assert target_result.status is DevicePreflightStatus.INCOMPATIBLE
+    assert target_result.reason_codes == ("TARGET_MISMATCH",)
+    assert wrong_target_runner.calls == 0
+
+
+def test_failed_tensorflow_tfe_repeat_invalidates_ready_contribution() -> None:
+    runner = FixedRunner(probe_report())
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=runner,
+    )
+    req = tensorflow_tfe_request()
+    assert provider.preflight(req).status is DevicePreflightStatus.READY
+    provider.build_contribution(req)
+
+    runner.report = probe_report(sm="sm_90")
+    failed = provider.preflight(req)
+
+    assert failed.reason_codes == ("CUDA_SM_MISMATCH",)
+    with pytest.raises(RuntimeError, match="requires successful preflight"):
+        provider.build_contribution(req)
 
 
 def test_failed_repeat_preflight_invalidates_prior_ready_request() -> None:

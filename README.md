@@ -20,6 +20,13 @@ semantics.
   inference + no-grad, `strided` layout, device memory, and an explicitly
   selected provider SM. An optional single SM in the domain requirement must
   match the provider selection.
+- A separate Linux x86_64 host-extension-only
+  `cuda-tensorflow-tfe-linux-x86_64` build-only capability for the frozen
+  TensorFlow TFE runtime-reuse prerequisite. It accepts one `gpu:0`,
+  `runtime="tensorflow-tfe"` requirement with TensorFlow 2.21.0, CPython 3.11,
+  eager + inference + no-grad, dense device memory, and an explicit provider
+  SM. It contributes only framework tensor and eager-context borrow/validate
+  records.
 - Explicit target capability, device ordinal, and `sm_NN` selection.
 - A fixed minimum CUDA driver floor of `12000` (CUDA 12.0): explicit provider
   configuration may raise this requirement but cannot lower it beneath the
@@ -52,7 +59,8 @@ All preflight and report records serialize `support_claim: false`.
 
 - macOS, every 32-bit target, Windows ARM, and non-NVIDIA accelerators.
 - CUDA kernel generation or performance claims.
-- PyTorch/tch-rs and TensorFlow/TFE CUDA lowering.
+- PyTorch/tch-rs and TensorFlow/TFE CUDA lowering. The framework-reuse
+  capabilities are provider-side prerequisites only.
 - Importing `torch`, inspecting a loaded libtorch image, proving one-image ABI
   identity, or certifying any real GPU execution.
 - Adopting, replacing, allocating, or synchronizing framework-owned resources.
@@ -68,6 +76,12 @@ raw context, raw stream, or raw allocation. Core can compose its borrow-only
 record, but that does not make the CPU-only `rextio-torch` plugin CUDA-capable:
 E2 still needs typed Torch CUDA lowering, one-libtorch-image/ABI proof, and
 real-GPU certification.
+
+The TensorFlow TFE capability has the same separation: it does not import
+TensorFlow, resolve TFE symbols, inspect loaded TensorFlow images, lower an
+operation, or execute a GPU kernel. Core can compose its borrow-only resource
+record, but the later E3 plugin work must add typed TensorFlow CUDA lowering,
+private-ABI/runtime-image checks, and real-device evidence.
 
 ## Explicit selection
 
@@ -127,6 +141,34 @@ the raw-driver lanes.
 Preflight records the pins as required-but-unverified request facts. It does
 not import PyTorch or assert that Python and generated Rust share one libtorch
 image.
+
+For the build-only TensorFlow TFE reuse lane, select
+`cuda-tensorflow-tfe-linux-x86_64`. The TensorFlow domain plugin must emit:
+
+```text
+DeviceRequirement(
+  logical_device="gpu:0",
+  backend="cuda",
+  runtime="tensorflow-tfe",
+  features=("eager", "inference", "no-grad"),
+  layouts=("dense",),
+  memory_spaces=("device",),
+  architectures=(),              # optional one-SM cross-check
+  reuse_domain_runtime=True,
+)
+RuntimeRequirement(
+  "tensorflow", "2.21.0", ("cuda", "python-wheel", "tfe-c-api")
+)
+RuntimeRequirement("cpython", "3.11", ("private-eager-abi",))
+```
+
+The TFE lane also requires `device_options.sm`, rejects every `toolkit_root`,
+and treats its pins only as required-but-unverified request facts. Its
+contribution contains no current-stream/event claim and grants the provider no
+permission to allocate, replace, or synchronize framework resources.
+
+Every preflight/report remains `support_claim: false`. This capability is not
+TensorFlow CUDA support and is not certification-ready.
 
 ## Probe trust boundary
 
