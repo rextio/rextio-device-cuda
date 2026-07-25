@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+
+from rextio.artifacts import ArtifactKind, ArtifactProfile, host_extension_profile
+from rextio.build.orchestrator import _resolve_build_device_plans
+from rextio.devices import (
+    DEVICE_PROVIDER_ENTRY_POINT,
+    DeviceProviderError,
+    DeviceProviderOptions,
+    DeviceProviderSelection,
+    load_selected_device_provider,
+    resolve_device_plan,
+)
+from rextio_device_cuda.config import CudaProviderConfig
+from rextio_device_cuda.probe import CudaToolkitReport
+from rextio_device_cuda.provider import (
+    CAPABILITY_LIBTORCH_LINUX_X86_64,
+    CAPABILITY_LINUX_X86_64,
+    CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+    PROVIDER_ID,
+    CudaDeviceProvider,
+)
+
+from test_provider import (
+    FixedRunner,
+    FixedToolkit,
+    libtorch_profile,
+    probe_report,
+    profile,
+    tensorflow_tfe_profile,
+)
+
+
+@dataclass(frozen=True)
+class FakeDistribution:
+    name: str = "rextio-device-cuda"
+    version: str = "0.1.0"
+
+
+class FakeEntryPoint:
+    name = PROVIDER_ID
+    group = DEVICE_PROVIDER_ENTRY_POINT
+    value = "rextio_device_cuda.provider:provider"
+    dist = FakeDistribution()
+
+    def __init__(self, payload: CudaDeviceProvider) -> None:
+        self._payload = payload
+
+    def load(self) -> CudaDeviceProvider:
+        return self._payload
+
+
+def ready_provider() -> CudaDeviceProvider:
+    return CudaDeviceProvider(
+        CudaProviderConfig(),
+        probe_runner=FixedRunner(probe_report()),
+        toolkit_inspector=FixedToolkit(
+            CudaToolkitReport(
+                version="12.8.0",
+                runtime_version="12.8.0",
+                components=("cuda-header", "cuda-runtime"),
+            )
+        ),
+    )
+
+
+def selection() -> DeviceProviderSelection:
+    return DeviceProviderSelection(
+        provider_id=PROVIDER_ID,
+        capability_id=CAPABILITY_LINUX_X86_64,
+    )
+
+
+def test_selected_provider_resolves_standalone_plan_with_redacted_options() -> None:
+    provider, source = load_selected_device_provider(
+        selection(),
+        entry_points=(FakeEntryPoint(ready_provider()),),
+    )
+    plan = resolve_device_plan(
+        artifact_profile=profile(),
+        selection=selection(),
+        providers={PROVIDER_ID: provider},
+        provider_sources={PROVIDER_ID: source},
+        options=DeviceProviderOptions(
+            values=(
+                ("device_ordinal", "0"),
+                ("sm", "sm_80"),
+            )
+        ),
+    )
+    assert plan is not None
+
+    record = plan.to_dict()
+    assert record["manifest"]["provider_id"] == PROVIDER_ID
+    assert record["contribution"]["native_libraries"] == []
+    assert record["contribution"]["package_references"]
+    assert record["report"]["certification_tier"] == "build-only"
+    assert record["report"]["support_claim"] is False
+    assert record["lock"]["option_keys"] == ["device_ordinal", "sm"]
+    assert record["lock"]["options_sha256"]
+
+
+def test_current_core_rejects_unmaterialized_runtime_contribution() -> None:
+    raw = profile()
+    host_profile = ArtifactProfile(
+        kind=ArtifactKind.HOST_EXTENSION,
+        target_triple=raw.target_triple,
+        packaging_backend="cargo",
+        python_fallback_backend="cpython",
+        device_requirements=raw.device_requirements,
+    )
+
+    with pytest.raises(DeviceProviderError, match="cannot be represented"):
+        _resolve_build_device_plans(
+            (host_profile,),
+            selection=selection(),
+            options=DeviceProviderOptions(values=(("device_ordinal", "0"), ("sm", "sm_80"))),
+            entry_points=(FakeEntryPoint(ready_provider()),),
+        )
+
+
+def test_current_core_accepts_borrow_only_libtorch_contribution() -> None:
+    framework = libtorch_profile()
+    host_profile = host_extension_profile(
+        framework.target_triple,
+        packaging_backend="cargo",
+        runtime_requirements=framework.runtime_requirements,
+        device_requirements=framework.device_requirements,
+    )
+
+    plans = _resolve_build_device_plans(
+        (host_profile,),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_LIBTORCH_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(values=(("device_ordinal", "0"), ("sm", "sm_80"))),
+        entry_points=(FakeEntryPoint(ready_provider()),),
+    )
+
+    assert len(plans) == 1
+    contribution = plans[0].contribution
+    assert contribution.package_references == ()
+    assert contribution.generated_helper_ids == ()
+    assert contribution.runtime_check_ids == ()
+    assert {item.resource_kind for item in contribution.resource_contracts} == {
+        "framework.allocator",
+        "framework.current-stream",
+        "framework.tensor",
+    }
+
+
+def test_current_core_accepts_borrow_only_tensorflow_tfe_contribution() -> None:
+    framework = tensorflow_tfe_profile()
+    host_profile = host_extension_profile(
+        framework.target_triple,
+        packaging_backend="cargo",
+        runtime_requirements=framework.runtime_requirements,
+        device_requirements=framework.device_requirements,
+    )
+
+    plans = _resolve_build_device_plans(
+        (host_profile,),
+        selection=DeviceProviderSelection(
+            provider_id=PROVIDER_ID,
+            capability_id=CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        ),
+        options=DeviceProviderOptions(
+            values=(("device_ordinal", "0"), ("sm", "sm_80"))
+        ),
+        entry_points=(FakeEntryPoint(ready_provider()),),
+    )
+
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan.preflight.support_claim is False
+    assert plan.lowering_authorization() is not None
+    assert plan.lowering_authorization().to_dict() == {
+        "provider_id": PROVIDER_ID,
+        "capability_id": CAPABILITY_TENSORFLOW_TFE_LINUX_X86_64,
+        "logical_device": "gpu:0",
+        "backend": "cuda",
+        "runtime": "tensorflow-tfe",
+        "reuse_domain_runtime": True,
+        "features": ["eager", "inference", "no-grad"],
+        "layouts": ["dense"],
+        "memory_spaces": ["device"],
+        "artifact_profile_sha256": plan.lock_record().artifact_profile_sha256,
+    }
+    contribution = plan.contribution
+    assert contribution.package_references == ()
+    assert contribution.generated_helper_ids == ()
+    assert contribution.runtime_check_ids == ()
+    assert {item.resource_kind for item in contribution.resource_contracts} == {
+        "framework.eager-context",
+        "framework.tensor",
+    }
+
+
+def test_missing_production_probe_fails_closed() -> None:
+    provider = CudaDeviceProvider(CudaProviderConfig(device_ordinal=0, sm="sm_80"))
+
+    with pytest.raises(DeviceProviderError, match="failed preflight"):
+        resolve_device_plan(
+            artifact_profile=profile(),
+            selection=selection(),
+            providers={PROVIDER_ID: provider},
+        )
+
+
+def test_unsupported_target_fails_before_probe() -> None:
+    unsupported = profile()
+    unsupported = unsupported.__class__(
+        kind=unsupported.kind,
+        target_triple="aarch64-apple-darwin",
+        packaging_backend=unsupported.packaging_backend,
+        device_requirements=unsupported.device_requirements,
+    )
+    runner = FixedRunner(probe_report())
+    provider = CudaDeviceProvider(
+        CudaProviderConfig(device_ordinal=0, sm="sm_80"),
+        probe_runner=runner,
+    )
+
+    with pytest.raises(DeviceProviderError, match="incompatible"):
+        resolve_device_plan(
+            artifact_profile=unsupported,
+            selection=selection(),
+            providers={PROVIDER_ID: provider},
+        )
+
+    assert runner.calls == 0

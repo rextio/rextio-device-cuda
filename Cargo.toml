@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "crates/rextio-cuda-driver-loader",
+  "crates/rextio-cuda-driver-probe",
+  "crates/rextio-cuda-runtime-smoke",
+  "src/rextio_device_cuda/rust/rextio-cuda-runtime",
+]
+resolver = "2"

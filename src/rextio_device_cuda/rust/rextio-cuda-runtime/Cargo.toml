@@ -1,0 +1,13 @@
+[package]
+name = "rextio-cuda-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Provider-owned raw CUDA Driver API lifetime primitives for rextio-device-cuda."
+publish = false
+
+[features]
+default = ["cuda-driver"]
+cuda-driver = []
+
+[dependencies]
