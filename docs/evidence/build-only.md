@@ -1,6 +1,6 @@
 # Build-only evidence statement
 
-The 0.1.0 candidate is limited to:
+The published 0.1.0 release is limited to:
 
 - Core Device Provider API 1 contract tests using injected, fixed reports;
 - exact-schema/path-free probe parser tests;

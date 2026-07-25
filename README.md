@@ -1,9 +1,15 @@
 # rextio-device-cuda
 
-`rextio-device-cuda` is the incubating first-party NVIDIA CUDA device provider
+`rextio-device-cuda` is the first-party NVIDIA CUDA device provider
 for [Rextio](https://github.com/rextio/rextio). Version 0.1.0 implements a
-bounded **Device Provider API 1 Alpha**. The source repository is public, the
-package is not on PyPI, and it does not claim certified CUDA execution support.
+bounded **Device Provider API 1 Alpha** and was published to PyPI on
+2026-07-26. The source repository and package are public. This is a
+non-certifying build-only release: it does not claim certified CUDA execution
+or formal framework CUDA support.
+
+```text
+pip install rextio-device-cuda==0.1.0
+```
 
 This is a device/runtime integration layer, not a Python lowering plugin. It
 does not claim AST nodes or understand NumPy, pandas, PyTorch, or TensorFlow
@@ -59,8 +65,9 @@ All preflight and report records serialize `support_claim: false`.
 
 - macOS, every 32-bit target, Windows ARM, and non-NVIDIA accelerators.
 - CUDA kernel generation or performance claims.
-- PyTorch/tch-rs and TensorFlow/TFE CUDA lowering. The framework-reuse
-  capabilities are provider-side prerequisites only.
+- Python-domain PyTorch/tch-rs or TensorFlow/TFE CUDA lowering. Companion
+  domain plugins own those semantics; this package contributes only the
+  provider-side runtime-reuse prerequisites.
 - Importing `torch`, inspecting a loaded libtorch image, proving one-image ABI
   identity, or certifying any real GPU execution.
 - Adopting, replacing, allocating, or synchronizing framework-owned resources.
@@ -69,23 +76,25 @@ All preflight and report records serialize `support_claim: false`.
 - Any claim based only on GitHub-hosted CI, a driver inventory, or a mock report.
 
 The raw-driver capabilities contribute a packaged-runtime reference, helper id,
-and inventory check id. Current Core 0.1.6 integration deliberately rejects
+and inventory check id. Core 0.1.6 deliberately rejects
 those unmaterialized inputs before generated writes. The separate libtorch
 capability contributes no raw runtime package, generated helper, runtime check,
 raw context, raw stream, or raw allocation. Core can compose its borrow-only
-record, but that does not make the CPU-only `rextio-torch` plugin CUDA-capable:
-E2 still needs typed Torch CUDA lowering, one-libtorch-image/ABI proof, and
-real-GPU certification.
+record, but this provider alone cannot make a `rextio-torch` route
+CUDA-capable. Typed Torch CUDA lowering, one-libtorch-image/ABI evidence, and
+any support promotion remain the companion plugin's separate responsibility.
 
 The TensorFlow TFE capability has the same separation: it does not import
 TensorFlow, resolve TFE symbols, inspect loaded TensorFlow images, lower an
 operation, or execute a GPU kernel. Core can compose its borrow-only resource
-record, but the later E3 plugin work must add typed TensorFlow CUDA lowering,
-private-ABI/runtime-image checks, and real-device evidence.
+record, but this provider alone cannot make a `rextio-tensorflow` route
+CUDA-capable. Typed TensorFlow CUDA lowering, private-ABI/runtime-image
+evidence, and any support promotion remain the companion plugin's separate
+responsibility.
 
 ## Explicit selection
 
-The future Core-side shape is explicit:
+The Core 0.1.6 selection shape is explicit:
 
 ```toml
 [target]
@@ -193,9 +202,10 @@ validation only on a trusted host/container filesystem.
 
 ## Development checks
 
-With the unreleased Core 0.1.6 source on `PYTHONPATH`:
+With Core 0.1.6 installed:
 
 ```bash
+python -m pip install "rextio==0.1.6"
 python -m pytest -q
 python -m ruff check src tests
 python -m mypy src

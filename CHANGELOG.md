@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.1.0 — Unreleased Alpha
+## 0.1.0 — 2026-07-26
+
+**Published non-certifying Alpha.** Package version `0.1.0` is tagged and
+published to PyPI as the first-party NVIDIA CUDA Device Provider API 1 package
+for Rextio. Publication does not promote any capability beyond build-only:
+every public preflight/report retains `support_claim=false`, and this release
+makes no formal CUDA execution, framework support, certification, or
+performance claim.
 
 - Add Device Provider API 1 manifest and exact entry-point identity.
 - Declare build-only NVIDIA CUDA capabilities for Linux x86_64/AArch64 and
@@ -52,5 +59,5 @@
   64-KiB/timeout-bounded probe reader, dynamic-driver-only linking, explicit
   driver-image/API drop ordering, and current-context restoration tests.
 
-No tag, PyPI upload, or CUDA support claim exists yet. The source repository is
-public; all capabilities remain unreleased and build-only.
+The source repository and PyPI package are public. All capabilities remain
+build-only and non-certifying; release publication is not a CUDA support claim.

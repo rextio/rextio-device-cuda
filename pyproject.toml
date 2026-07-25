@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rextio-device-cuda"
 dynamic = ["version"]
-description = "Incubating NVIDIA CUDA Device Provider API 1 Alpha for Rextio."
+description = "First-party NVIDIA CUDA Device Provider API 1 Alpha for Rextio."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

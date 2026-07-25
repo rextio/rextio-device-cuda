@@ -1,6 +1,6 @@
 # Support matrix
 
-Status: **unreleased build-only Alpha**.
+Status: **published 0.1.0 build-only, non-certifying Alpha (2026-07-26)**.
 
 | Target | Declaration | Hosted CI | Real NVIDIA evidence | Certification |
 |---|---|---:|---:|---|
@@ -48,15 +48,17 @@ Before any target can be promoted beyond build-only:
    `support_claim=false` until an owner-approved certification update;
 7. add a secure Core helper-materialization contract and a domain adapter.
 
-For the libtorch-reuse capability, promotion additionally requires the Torch E2
-domain work: device-preserving lowering, one-libtorch-image/ABI proof, and a
-real Linux x86_64 GPU vertical slice. Raw-driver E1 certification alone cannot
-promote the framework-reuse row.
+For the libtorch-reuse capability, any promotion additionally requires
+owner-approved companion Torch E2 evidence covering device-preserving
+lowering, one-libtorch-image/ABI identity, and a real Linux x86_64 GPU vertical
+slice. A separately verified non-certifying plugin harness does not by itself
+promote this provider row.
 
-For the TensorFlow TFE capability, promotion additionally requires E3 typed
-device-preserving lowering, exact TensorFlow-wheel/private-ABI image identity,
-GPU:0 backing-device and same-context checks, and a real Linux x86_64 GPU
-vertical slice. The evidence must retain `support_claim=false` and
+For the TensorFlow TFE capability, any promotion likewise requires
+owner-approved companion E3 evidence covering typed device-preserving
+lowering, exact TensorFlow-wheel/private-ABI image identity, GPU:0
+backing-device and same-context checks, and a real Linux x86_64 GPU vertical
+slice. The evidence must retain `support_claim=false` and
 `certification_ready=false` until a separate owner-approved promotion.
 
 The current manual scripts cover steps 1–3: they run inventory and a separate
