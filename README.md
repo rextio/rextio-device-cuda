@@ -1,7 +1,7 @@
 # rextio-device-cuda
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/rextio/rextio-device-cuda/main/assets/readme/rextio-icon.png" width="96" alt="Rextio icon">
+  <img src="./assets/readme/rextio-icon.png" width="96" alt="Rextio icon">
 </p>
 
 <p align="center"><strong>Explicit, fail-closed CUDA capability discovery for Rextio.</strong></p>
