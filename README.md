@@ -1,102 +1,60 @@
 # rextio-device-cuda
 
-`rextio-device-cuda` is the first-party NVIDIA CUDA device provider
-for [Rextio](https://github.com/rextio/rextio). Version 0.1.0 implements a
-bounded **Device Provider API 1 Alpha** and was published to PyPI on
-2026-07-26. The source repository and package are public. This is a
-non-certifying build-only release: it does not claim certified CUDA execution
-or formal framework CUDA support.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rextio/rextio-device-cuda/main/assets/readme/rextio-icon.png" width="96" alt="Rextio icon">
+</p>
+
+<p align="center"><strong>Explicit, fail-closed CUDA capability discovery for Rextio.</strong></p>
+
+<p align="center">
+  English · <a href="https://github.com/rextio/rextio-device-cuda/blob/main/README.ko.md">한국어</a> · <a href="https://github.com/rextio/rextio-device-cuda/blob/main/README.zh-hans.md">简体中文</a> · <a href="https://github.com/rextio/rextio-device-cuda/blob/main/README.zh-hant.md">繁體中文</a> · <a href="https://github.com/rextio/rextio-device-cuda/blob/main/README.ja.md">日本語</a>
+</p>
+
+`rextio-device-cuda` is the first-party NVIDIA CUDA Device Provider for Rextio. It validates an explicitly selected driver, device, architecture, and runtime contract, then exposes provider capabilities to a domain plugin.
+
+> **Published non-certifying Alpha 0.1.0** (2026-07-26). Requires Python 3.11+ and `rextio>=0.1.6,<0.2`. All preflight and report records serialize `support_claim: false`.
+>
+> This is a capability provider—not a Python lowering plugin. It derives no NumPy, pandas, PyTorch, TensorFlow, or other Python semantics, executes no product GPU kernel, and currently makes no CUDA support, certification, or performance claim.
+
+## What is proven today
+
+- Device Provider API 1 manifests, explicit option validation, deterministic lock/resource records, and packaged Rust runtime source.
+- Path-safe, explicitly configured CUDA Driver API inventory with fixed driver/toolkit floors.
+- Mocked/hosted contract tests and Rust RAII tests for provider-owned context, stream, and device allocation lifetimes.
+- Borrow/validate-only framework reuse contracts for the pinned libtorch and TensorFlow TFE lanes.
+
+Mock reports, hosted CI, inventory, and manual lifetime smoke are **not GPU execution certification**. Manual smoke records `support_claim=false`, `kernel_executed=false`, and `certification_ready=false`.
+
+## How it works
 
 ```text
-pip install rextio-device-cuda==0.1.0
+domain plugin requirement
+        +
+explicit provider selection/options
+        ↓
+driver/device/SM preflight → capability contribution → Core composition
 ```
 
-This is a device/runtime integration layer, not a Python lowering plugin. It
-does not claim AST nodes or understand NumPy, pandas, PyTorch, or TensorFlow
-semantics.
+The domain plugin owns Python semantics and must emit a matching CUDA `DeviceRequirement`. The provider validates the requested capability and contributes only the resources permitted by that capability. Configuration alone never turns CPU Python into GPU code.
 
-## Current bounded surface
+## Quick start
 
-- NVIDIA CUDA only.
-- Linux x86_64, Linux AArch64, and Windows x86_64 target declarations.
-- A separate Linux x86_64 host-extension-only
-  `cuda-libtorch-linux-x86_64` build-only capability that accepts one `gpu:0`
-  / `backend="cuda"` / `runtime="libtorch"` requirement and reuses the domain
-  runtime. Its frozen contract requires libtorch/PyTorch 2.11.0, tch 0.24.0,
-  inference + no-grad, `strided` layout, device memory, and an explicitly
-  selected provider SM. An optional single SM in the domain requirement must
-  match the provider selection.
-- A separate Linux x86_64 host-extension-only
-  `cuda-tensorflow-tfe-linux-x86_64` build-only capability for the frozen
-  TensorFlow TFE runtime-reuse prerequisite. It accepts one `gpu:0`,
-  `runtime="tensorflow-tfe"` requirement with TensorFlow 2.21.0, CPython 3.11,
-  eager + inference + no-grad, dense device memory, and an explicit provider
-  SM. It contributes only framework tensor and eager-context borrow/validate
-  records.
-- Explicit target capability, device ordinal, and `sm_NN` selection.
-- A fixed minimum CUDA driver floor of `12000` (CUDA 12.0): explicit provider
-  configuration may raise this requirement but cannot lower it beneath the
-  manifest contract.
-- A fixed raw-driver CUDA toolkit/runtime floor of 12.0: explicit provider
-  configuration may raise it but cannot weaken the manifest, and
-  toolkit/runtime reports must name one identical version at or above that
-  floor. The libtorch-reuse lane does not inspect a standalone toolkit.
-- CUDA Driver API inventory through an explicitly configured probe executable.
-- No `PATH`, registry, common-directory, or ambient-environment discovery.
-- Optional validation of an explicitly configured CUDA toolkit root for the
-  raw-driver lanes.
-- Deterministic provider manifest, preflight observations, lock inputs,
-  resource contracts, and packaged Rust runtime source. A shared driver loader
-  owned by the manual host resolves symbols from one reviewed CUDA Driver
-  image and injects them into the runtime; generated artifacts do not add a
-  direct `cuda` / `nvcuda` link directive. The host must retain that image
-  handle until every injected `DriverApi` and child resource is dropped.
-- Provider-owned raw context, dedicated stream, and device-allocation RAII
-  primitives. Children keep their context alive and are deliberately
-  thread-affine (`!Send` / `!Sync`) in this Alpha.
-- Framework tensor, allocator, current-stream, and event resources are
-  framework-owned. The libtorch-reuse capability contributes borrow/validate
-  contracts only for the tensor, allocator, and current stream; it creates,
-  replaces, allocates, and synchronizes none of them.
+```bash
+python -m pip install "rextio-device-cuda==0.1.0"
+```
 
-All preflight and report records serialize `support_claim: false`.
+The PyPI wheel registers the provider and includes its Rust runtime source, but it does **not** install `rextio-cuda-driver-probe`. A raw-driver lane therefore needs a trusted source checkout and an explicit probe build:
 
-## Unsupported and deferred
+```bash
+git clone --branch 0.1.0 --depth 1 https://github.com/rextio/rextio-device-cuda.git
+cd rextio-device-cuda
+cargo +1.93.1 build --locked --release -p rextio-cuda-driver-probe
+```
 
-- macOS, every 32-bit target, Windows ARM, and non-NVIDIA accelerators.
-- CUDA kernel generation or performance claims.
-- Python-domain PyTorch/tch-rs or TensorFlow/TFE CUDA lowering. Companion
-  domain plugins own those semantics; this package contributes only the
-  provider-side runtime-reuse prerequisites.
-- Importing `torch`, inspecting a loaded libtorch image, proving one-image ABI
-  identity, or certifying any real GPU execution.
-- Adopting, replacing, allocating, or synchronizing framework-owned resources.
-- Automatic provider selection or implicit hardware discovery.
-- General Core materialization of the packaged Rust helper.
-- Any claim based only on GitHub-hosted CI, a driver inventory, or a mock report.
-
-The raw-driver capabilities contribute a packaged-runtime reference, helper id,
-and inventory check id. Core 0.1.6 deliberately rejects
-those unmaterialized inputs before generated writes. The separate libtorch
-capability contributes no raw runtime package, generated helper, runtime check,
-raw context, raw stream, or raw allocation. Core can compose its borrow-only
-record, but this provider alone cannot make a `rextio-torch` route
-CUDA-capable. Typed Torch CUDA lowering, one-libtorch-image/ABI evidence, and
-any support promotion remain the companion plugin's separate responsibility.
-
-The TensorFlow TFE capability has the same separation: it does not import
-TensorFlow, resolve TFE symbols, inspect loaded TensorFlow images, lower an
-operation, or execute a GPU kernel. Core can compose its borrow-only resource
-record, but this provider alone cannot make a `rextio-tensorflow` route
-CUDA-capable. Typed TensorFlow CUDA lowering, private-ABI/runtime-image
-evidence, and any support promotion remain the companion plugin's separate
-responsibility.
-
-## Explicit selection
-
-The Core 0.1.6 selection shape is explicit:
+Use the resulting absolute path below (`target/release/rextio-cuda-driver-probe.exe` on Windows).
 
 ```toml
+# rextio.toml
 [target]
 device_provider = "rextio-device-cuda"
 device_capability = "cuda-linux-x86_64"
@@ -105,143 +63,90 @@ device_capability = "cuda-linux-x86_64"
 probe_executable = "/absolute/path/to/rextio-cuda-driver-probe"
 device_ordinal = "0"
 sm = "sm_80"
-# toolkit_root = "/absolute/path/to/cuda"  # optional validation only
+# toolkit_root = "/absolute/path/to/cuda"  # optional validation for raw-driver lanes
 ```
 
-Raw option values remain in memory. Public locks and reports include option
-names plus a SHA-256 digest, never the paths themselves. The target's domain
-plugin must also emit the matching CUDA `DeviceRequirement`; configuration
-alone does not turn CPU Python into GPU code.
+The raw option values stay in memory. Public locks and reports record option names plus a SHA-256 digest, never the configured paths. The entry point is `rextio-device-cuda` in `rextio.device_providers`.
 
-Production Core resolution must supply the probe, device, SM, and raw-lane
-toolkit inputs through the request's redacted `DeviceProviderOptions` so their
-keys and digest enter provenance. Constructor `CudaProviderConfig` values and
-injected probe/toolkit implementations are programmatic/manual-test boundaries,
-not production Core provenance. Ready observations record the effective
-minimum driver floor and, for raw lanes, the minimum toolkit floor; they contain
-no paths.
+## Declared capabilities
 
-The entry-point identity is exactly `rextio-device-cuda` in the
-`rextio.device_providers` group.
+| Capability / target | Contract | Current status |
+| --- | --- | --- |
+| `cuda-linux-x86_64` | raw-driver CUDA, explicit probe/device/SM, optional toolkit root | build-only, not certified |
+| `cuda-linux-aarch64` | explicit probe/device/SM, optional toolkit root | build-only cross-check, not certified |
+| `cuda-windows-x86_64` | explicit probe/device/SM, optional toolkit root | build-only, not certified |
+| `cuda-libtorch-linux-x86_64` | PyTorch/libtorch 2.11.0 + tch 0.24.0 runtime reuse | borrow/validate only, not PyTorch CUDA support |
+| `cuda-tensorflow-tfe-linux-x86_64` | TensorFlow 2.21.0 + CPython 3.11 TFE runtime reuse | borrow/validate only, not TensorFlow CUDA support |
 
-For the build-only libtorch reuse lane, select
-`cuda-libtorch-linux-x86_64` instead. The Torch domain plugin must emit the
-following frozen facts; users must not forge them to bypass domain analysis:
+Supported architecture vocabulary: `sm_60`, `sm_61`, `sm_70`, `sm_72`, `sm_75`, `sm_80`, `sm_86`, `sm_87`, `sm_89`, and `sm_90`. A declaration is compatibility metadata, not proof that an installed system can execute it.
 
-```text
-DeviceRequirement(
-  logical_device="gpu:0",
-  backend="cuda",
-  runtime="libtorch",
-  features=("inference", "no-grad"),
-  layouts=("strided",),
-  memory_spaces=("device",),
-  architectures=(),              # optional one-SM cross-check
-  reuse_domain_runtime=True,
-)
-RuntimeRequirement("libtorch", "2.11.0", ("cuda", "pytorch-wheel"))
-RuntimeRequirement("tch", "0.24.0", ("cuda",))
-```
+The minimum raw-driver contract is CUDA driver `12000` (12.0) and toolkit/runtime 12.0. Explicit configuration may raise these floors, never lower them. Toolkit and runtime reports must name one identical version at or above the floor. Framework-reuse lanes reject `toolkit_root` because they do not own a standalone toolkit.
 
-`device_options.sm` remains mandatory and is checked against the driver probe.
-The libtorch lane rejects `toolkit_root` whether supplied as a target option or
-constructor configuration because standalone toolkit ownership belongs only to
-the raw-driver lanes.
-Preflight records the pins as required-but-unverified request facts. It does
-not import PyTorch or assert that Python and generated Rust share one libtorch
-image.
+## Framework reuse boundaries
 
-For the build-only TensorFlow TFE reuse lane, select
-`cuda-tensorflow-tfe-linux-x86_64`. The TensorFlow domain plugin must emit:
+### libtorch lane
 
-```text
-DeviceRequirement(
-  logical_device="gpu:0",
-  backend="cuda",
-  runtime="tensorflow-tfe",
-  features=("eager", "inference", "no-grad"),
-  layouts=("dense",),
-  memory_spaces=("device",),
-  architectures=(),              # optional one-SM cross-check
-  reuse_domain_runtime=True,
-)
-RuntimeRequirement(
-  "tensorflow", "2.21.0", ("cuda", "python-wheel", "tfe-c-api")
-)
-RuntimeRequirement("cpython", "3.11", ("private-eager-abi",))
-```
+The domain requirement must select `gpu:0`, `backend="cuda"`, `runtime="libtorch"`, inference + no-grad, strided device memory, libtorch/PyTorch 2.11.0, tch 0.24.0, and the selected provider SM. The provider contributes framework tensor, allocator, and current-stream borrow/validate records only.
 
-The TFE lane also requires `device_options.sm`, rejects every `toolkit_root`,
-and treats its pins only as required-but-unverified request facts. Its
-contribution contains no current-stream/event claim and grants the provider no
-permission to allocate, replace, or synchronize framework resources.
+It does not import torch, inspect loaded libtorch/ATen images, prove one-image ABI identity, allocate or synchronize framework resources, or execute an operation. This provider alone cannot make a `rextio-torch` route CUDA-capable.
 
-Every preflight/report remains `support_claim: false`. This capability is not
-TensorFlow CUDA support and is not certification-ready.
+### TensorFlow TFE lane
 
-## Probe trust boundary
+The domain requirement must select `gpu:0`, `runtime="tensorflow-tfe"`, eager + inference + no-grad, dense device memory, TensorFlow 2.21.0, CPython 3.11, and the selected provider SM. The provider contributes framework tensor and eager-context borrow/validate records only.
 
-The Rust inventory probe is ported from the reviewed Rextio Core implementation
-at `ea568220467f469371452092493d00a2aa42d701`.
+It does not import TensorFlow, resolve TFE/private bridge symbols, inspect runtime images, claim current-stream/event control, allocate or synchronize framework resources, or execute a GPU kernel. This provider alone cannot make a `rextio-tensorflow` route CUDA-capable.
 
-`support_claim` remains false. Selecting or executing a configured probe does
-not bind the probe binary's content identity, and therefore is not certification
-evidence by itself.
+## Unsupported and deferred
 
-- Windows loads only `nvcuda.dll` from System32 with
-  `LOAD_LIBRARY_SEARCH_SYSTEM32`.
-- Linux tries an architecture-specific list of absolute `libcuda.so.1` paths,
-  canonicalizes the selected image, and rejects paths outside reviewed system
-  roots or mutable files/ancestors.
-- The probe calls only `cuInit`, driver version, device enumeration, device
-  name, and compute-capability entry points.
+- macOS, every 32-bit target, Windows ARM, and non-NVIDIA accelerators.
+- CUDA kernel generation, automatic provider selection, implicit hardware discovery, and performance claims.
+- Python-domain framework lowering, one-image ABI proof, and formal real-GPU support/certification.
+- General Core materialization of the packaged raw-driver Rust helper. Core 0.1.6 rejects unmaterialized raw-runtime inputs before generated writes.
+- Adopting, replacing, allocating, or synchronizing framework-owned resources.
 
-Absolute top-level selection does not neutralize `LD_PRELOAD`, transitive
-`DT_NEEDED` resolution, a compromised same-UID process, or a hostile OS. Run
-validation only on a trusted host/container filesystem.
+Provider-owned raw contexts, streams, and allocations are RAII-managed and deliberately thread-affine (`!Send` / `!Sync`) in this Alpha. The host-owned shared driver loader must outlive every injected API and child resource.
 
-## Development checks
+Any future Core materializer must prove that the image handle outlives the runtime API, contexts, streams, and allocations.
 
-With Core 0.1.6 installed:
+## Probe and security boundary
 
-```bash
-python -m pip install "rextio==0.1.6"
-python -m pytest -q
-python -m ruff check src tests
-python -m mypy src
-cargo +1.93.1 fmt --all -- --check
-cargo +1.93.1 test --workspace
-cargo +1.93.1 clippy --workspace --all-targets -- -D warnings
-```
+- There is no `PATH`, registry, common-directory, or ambient-environment discovery. Production preflight requires an explicit absolute probe path.
+- Linux tries reviewed absolute `libcuda.so.1` paths, canonicalizes the selected image, and rejects mutable/unreviewed roots. Windows loads `nvcuda.dll` from System32.
+- Probe output is bounded and exact-schema. Selecting a probe does not bind its content identity and is not certification evidence.
+- Absolute paths do not neutralize `LD_PRELOAD`, transitive dependencies, same-UID compromise, or a hostile OS. Run validation only on a trusted host/filesystem.
 
-The packaged runtime source is independently compiled and tested, but Core does
-not yet inject it into generated artifacts. A future Core materializer must own
-the shared loader, resolve the complete symbol table from one image, and prove
-that the image handle outlives the runtime API, contexts, streams, and
-allocations.
+See [SECURITY.md](SECURITY.md) before running a probe and [the support matrix](docs/support-matrix.md) for the remaining certification gates.
 
 ## Manual NVIDIA inventory
 
-On a trusted NVIDIA Linux host:
+Trusted Linux host:
 
 ```bash
 ./scripts/validate-linux-nvidia.sh sm_80 0 /usr/local/cuda
 ```
 
-On Windows PowerShell:
+Trusted Windows PowerShell host:
 
 ```powershell
 .\scripts\validate-windows-nvidia.ps1 -Sm sm_80 -DeviceOrdinal 0 `
   -ToolkitRoot "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
 ```
 
-Both scripts build the exact local probe, run standalone provider resolution,
-and execute a separate real-driver RAII lifetime smoke. Their JSON output
-remains preflight/lifetime evidence only:
-`support_claim=false`, `kernel_executed=false`, and
-`certification_ready=false`. See [the support matrix](docs/support-matrix.md)
-for the remaining real-device gate.
+Both scripts require exact Rust 1.93.1, build the local probe, perform provider resolution, and run a separate raw-driver RAII lifetime smoke. They do not execute a CUDA product kernel or promote support.
+
+## Development
+
+```bash
+python -m pip install "rextio==0.1.6"
+python -m pytest -q
+python -m ruff check src tests
+python -m mypy src
+cargo +1.93.1 test --workspace
+cargo +1.93.1 clippy --workspace --all-targets -- -D warnings
+```
+
+See [CHANGELOG.md](CHANGELOG.md) and the [build-only evidence statement](docs/evidence/build-only.md).
 
 ## License
 
-MIT.
+MIT
